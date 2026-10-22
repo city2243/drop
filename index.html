@@ -1,0 +1,374 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<title>我的收件匣</title>
+<style>
+  :root {
+    --bg: #f6f7f9; --card: #ffffff; --text: #1d2330; --muted: #6b7280;
+    --line: #e3e6eb; --accent: #2563eb; --accent-text: #ffffff; --danger: #c0392b;
+    --ok: #15803d;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #14171c; --card: #1d2128; --text: #e6e8eb; --muted: #9aa3ae;
+      --line: #2e333b; --accent: #4f8cff; --accent-text: #ffffff; --danger: #ef6b5b;
+      --ok: #4ade80;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 16px/1.6 -apple-system, "Segoe UI", "Microsoft JhengHei", "PingFang TC", sans-serif;
+  }
+  main { max-width: 760px; margin: 0 auto; padding: 24px 16px 64px; }
+  h1 { font-size: 22px; margin: 0 0 16px; display: flex; justify-content: space-between; align-items: center; gap: 8px; }
+  h2 { font-size: 17px; margin: 0 0 12px; }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 16px; margin-bottom: 16px; }
+  textarea, input[type=password] {
+    width: 100%; padding: 10px 12px; border: 1px solid var(--line); border-radius: 8px;
+    background: var(--bg); color: var(--text); font: inherit;
+  }
+  textarea { min-height: 120px; resize: vertical; }
+  button {
+    font: inherit; border: 0; border-radius: 8px; padding: 8px 16px; cursor: pointer;
+    background: var(--accent); color: var(--accent-text);
+  }
+  button.ghost { background: transparent; color: var(--muted); border: 1px solid var(--line); padding: 4px 10px; font-size: 14px; }
+  button.danger { color: var(--danger); }
+  button:disabled { opacity: .5; cursor: default; }
+  .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-top: 10px; }
+  .muted { color: var(--muted); font-size: 14px; }
+  .status { font-size: 14px; min-height: 1.4em; }
+  .status.err { color: var(--danger); }
+  .status.ok { color: var(--ok); }
+  .drop {
+    border: 2px dashed var(--line); border-radius: 10px; padding: 24px; text-align: center;
+    color: var(--muted); cursor: pointer;
+  }
+  .drop.over { border-color: var(--accent); color: var(--accent); }
+  ul { list-style: none; margin: 12px 0 0; padding: 0; }
+  li { border-top: 1px solid var(--line); padding: 10px 0; }
+  .note-text { white-space: pre-wrap; word-break: break-word; margin: 0 0 6px; }
+  .file-row { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
+  .file-name { word-break: break-all; }
+  .actions { display: flex; gap: 6px; flex-shrink: 0; }
+  .hidden { display: none; }
+  a { color: var(--accent); }
+</style>
+</head>
+<body>
+<main>
+  <h1><span>我的收件匣</span><button id="logout" class="ghost hidden">登出這台裝置</button></h1>
+
+  <!-- 登入 -->
+  <section id="login" class="card hidden">
+    <h2>輸入金鑰</h2>
+    <p class="muted">內容存在你的私人 GitHub repo,沒有金鑰的人打開這頁什麼都看不到。金鑰只存在這台裝置的瀏覽器裡。</p>
+    <input id="token" type="password" placeholder="github_pat_…" autocomplete="off">
+    <div class="row">
+      <label class="muted"><input id="remember" type="checkbox" checked> 記住這台裝置</label>
+      <button id="loginBtn">進入</button>
+    </div>
+    <div id="loginStatus" class="status"></div>
+  </section>
+
+  <div id="app" class="hidden">
+    <!-- 文字 -->
+    <section class="card">
+      <h2>貼上文字</h2>
+      <textarea id="noteInput" placeholder="貼上要存的文字…(Ctrl+Enter 送出)"></textarea>
+      <div class="row">
+        <button id="saveNote">儲存</button>
+        <span id="noteStatus" class="status"></span>
+      </div>
+      <ul id="notes"></ul>
+      <div class="row"><button id="moreNotes" class="ghost hidden">顯示更多</button></div>
+    </section>
+
+    <!-- 檔案 -->
+    <section class="card">
+      <h2>檔案</h2>
+      <div id="drop" class="drop">把 Word / Excel / PowerPoint 檔拖到這裡,或點這裡選檔<br><span class="muted">單檔上限 50 MB</span></div>
+      <input id="fileInput" type="file" multiple class="hidden">
+      <div id="fileStatus" class="status"></div>
+      <ul id="files"></ul>
+    </section>
+  </div>
+</main>
+
+<script>
+// 儲存空間:私人 repo。網頁本身放在公開 repo,不含任何秘密。
+const OWNER = "city2243";
+const REPO = "drop-storage";
+const API = `https://api.github.com/repos/${OWNER}/${REPO}/contents/`;
+const MAX_BYTES = 50 * 1024 * 1024;
+const NOTES_PAGE = 30;
+
+const $ = id => document.getElementById(id);
+let token = "";
+let noteEntries = [];   // notes/ 目錄清單(新到舊)
+let notesShown = 0;
+
+function readStored() {
+  try { return localStorage.getItem("drop_token") || sessionStorage.getItem("drop_token") || ""; }
+  catch { return ""; }
+}
+function store(t, remember) {
+  try {
+    if (remember) localStorage.setItem("drop_token", t); else sessionStorage.setItem("drop_token", t);
+  } catch {}
+}
+function forget() {
+  try { localStorage.removeItem("drop_token"); sessionStorage.removeItem("drop_token"); } catch {}
+}
+
+function setStatus(el, msg, kind) {
+  el.textContent = msg;
+  el.className = "status" + (kind ? " " + kind : "");
+}
+
+function encPath(path) {
+  return path.split("/").map(encodeURIComponent).join("/");
+}
+
+async function gh(path, opts = {}) {
+  const res = await fetch(API + encPath(path), {
+    ...opts,
+    headers: {
+      "Authorization": "Bearer " + token,
+      "Accept": opts.accept || "application/vnd.github+json",
+      "X-GitHub-Api-Version": "2022-11-28",
+      ...(opts.body ? { "Content-Type": "application/json" } : {}),
+    },
+    cache: "no-store",
+  });
+  if (res.status === 404 && opts.allow404) return null;
+  if (!res.ok) {
+    let msg = res.status + " " + res.statusText;
+    try { const j = await res.json(); if (j.message) msg = res.status + " " + j.message; } catch {}
+    throw new Error(msg);
+  }
+  return res;
+}
+
+function bytesToB64(bytes) {
+  let bin = "";
+  const chunk = 0x8000;
+  for (let i = 0; i < bytes.length; i += chunk) {
+    bin += String.fromCharCode.apply(null, bytes.subarray(i, i + chunk));
+  }
+  return btoa(bin);
+}
+
+function stamp() {
+  const d = new Date(), p = n => String(n).padStart(2, "0");
+  return `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`;
+}
+function stampLabel(name) {
+  const m = name.match(/^(\d{4})(\d{2})(\d{2})-(\d{2})(\d{2})(\d{2})/);
+  return m ? `${m[1]}/${m[2]}/${m[3]} ${m[4]}:${m[5]}` : "";
+}
+function prettySize(n) {
+  if (n < 1024) return n + " B";
+  if (n < 1024 * 1024) return (n / 1024).toFixed(0) + " KB";
+  return (n / 1024 / 1024).toFixed(1) + " MB";
+}
+
+async function putFile(path, b64, message) {
+  return gh(path, { method: "PUT", body: JSON.stringify({ message, content: b64 }) });
+}
+async function deletePath(path, sha) {
+  return gh(path, { method: "DELETE", body: JSON.stringify({ message: "delete " + path, sha }) });
+}
+async function listDir(dir) {
+  const res = await gh(dir, { allow404: true });
+  if (!res) return [];
+  const items = await res.json();
+  return items.filter(i => i.type === "file" && i.name !== ".keep")
+              .sort((a, b) => b.name.localeCompare(a.name));
+}
+async function rawBlob(path) {
+  const res = await gh(path, { accept: "application/vnd.github.raw" });
+  return res.blob();
+}
+
+// ---------- 登入 ----------
+async function tryLogin(t, remember, quiet) {
+  token = t.trim();
+  if (!token) return;
+  try {
+    // 用 repo 根目錄測試金鑰能不能讀
+    const res = await fetch(`https://api.github.com/repos/${OWNER}/${REPO}`, {
+      headers: { "Authorization": "Bearer " + token, "Accept": "application/vnd.github+json" },
+      cache: "no-store",
+    });
+    if (!res.ok) throw new Error(res.status === 401 ? "金鑰無效或已過期" : res.status === 404 ? "這把金鑰讀不到儲存空間(建立時要勾 drop-storage)" : "錯誤 " + res.status);
+    store(token, remember);
+    $("login").classList.add("hidden");
+    $("app").classList.remove("hidden");
+    $("logout").classList.remove("hidden");
+    loadNotes(); loadFiles();
+  } catch (e) {
+    token = "";
+    if (quiet) forget();
+    showLogin(quiet ? "記住的金鑰失效了,請重新輸入:" + e.message : e.message);
+  }
+}
+function showLogin(msg) {
+  $("app").classList.add("hidden");
+  $("logout").classList.add("hidden");
+  $("login").classList.remove("hidden");
+  setStatus($("loginStatus"), msg || "", msg ? "err" : "");
+}
+$("loginBtn").onclick = () => tryLogin($("token").value, $("remember").checked, false);
+$("token").addEventListener("keydown", e => { if (e.key === "Enter") $("loginBtn").click(); });
+$("logout").onclick = () => { forget(); token = ""; $("token").value = ""; showLogin(); };
+
+// ---------- 文字 ----------
+async function loadNotes() {
+  $("notes").innerHTML = '<li class="muted">載入中…</li>';
+  try {
+    noteEntries = await listDir("notes");
+    notesShown = 0;
+    $("notes").innerHTML = noteEntries.length ? "" : '<li class="muted">還沒有文字</li>';
+    await showMoreNotes();
+  } catch (e) { $("notes").innerHTML = `<li class="status err">讀取失敗:${e.message}</li>`; }
+}
+async function showMoreNotes() {
+  const batch = noteEntries.slice(notesShown, notesShown + NOTES_PAGE);
+  notesShown += batch.length;
+  const texts = await Promise.all(batch.map(n => rawBlob(n.path).then(b => b.text()).catch(() => "(讀取失敗)")));
+  batch.forEach((n, i) => $("notes").appendChild(noteItem(n, texts[i])));
+  $("moreNotes").classList.toggle("hidden", notesShown >= noteEntries.length);
+}
+function noteItem(n, text) {
+  const li = document.createElement("li");
+  const p = document.createElement("p");
+  p.className = "note-text"; p.textContent = text;
+  const row = document.createElement("div");
+  row.className = "file-row";
+  const when = document.createElement("span");
+  when.className = "muted"; when.textContent = stampLabel(n.name);
+  const acts = document.createElement("div");
+  acts.className = "actions";
+  const copy = document.createElement("button");
+  copy.className = "ghost"; copy.textContent = "複製";
+  copy.onclick = async () => {
+    try { await navigator.clipboard.writeText(text); copy.textContent = "已複製"; }
+    catch { copy.textContent = "複製失敗"; }
+    setTimeout(() => copy.textContent = "複製", 1500);
+  };
+  const del = document.createElement("button");
+  del.className = "ghost danger"; del.textContent = "刪除";
+  del.onclick = async () => {
+    if (!confirm("刪除這則文字?")) return;
+    del.disabled = true;
+    try { await deletePath(n.path, n.sha); li.remove(); }
+    catch (e) { alert("刪除失敗:" + e.message); del.disabled = false; }
+  };
+  acts.append(copy, del);
+  row.append(when, acts);
+  li.append(p, row);
+  return li;
+}
+$("moreNotes").onclick = showMoreNotes;
+$("saveNote").onclick = async () => {
+  const text = $("noteInput").value;
+  if (!text.trim()) return;
+  $("saveNote").disabled = true;
+  setStatus($("noteStatus"), "儲存中…");
+  try {
+    const b64 = bytesToB64(new TextEncoder().encode(text));
+    await putFile(`notes/${stamp()}.txt`, b64, "add note");
+    $("noteInput").value = "";
+    setStatus($("noteStatus"), "已儲存", "ok");
+    loadNotes();
+  } catch (e) { setStatus($("noteStatus"), "儲存失敗:" + e.message, "err"); }
+  $("saveNote").disabled = false;
+};
+$("noteInput").addEventListener("keydown", e => {
+  if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) $("saveNote").click();
+});
+
+// ---------- 檔案 ----------
+function displayName(name) { return name.replace(/^\d{8}-\d{6}_/, ""); }
+
+async function loadFiles() {
+  $("files").innerHTML = '<li class="muted">載入中…</li>';
+  try {
+    const items = await listDir("files");
+    $("files").innerHTML = items.length ? "" : '<li class="muted">還沒有檔案</li>';
+    items.forEach(f => $("files").appendChild(fileItem(f)));
+  } catch (e) { $("files").innerHTML = `<li class="status err">讀取失敗:${e.message}</li>`; }
+}
+function fileItem(f) {
+  const li = document.createElement("li");
+  li.className = "file-row";
+  const info = document.createElement("div");
+  const name = document.createElement("div");
+  name.className = "file-name"; name.textContent = displayName(f.name);
+  const meta = document.createElement("div");
+  meta.className = "muted"; meta.textContent = `${stampLabel(f.name)} · ${prettySize(f.size)}`;
+  info.append(name, meta);
+  const acts = document.createElement("div");
+  acts.className = "actions";
+  const dl = document.createElement("button");
+  dl.className = "ghost"; dl.textContent = "下載";
+  dl.onclick = async () => {
+    dl.disabled = true; dl.textContent = "下載中…";
+    try {
+      const blob = await rawBlob(f.path);
+      const a = document.createElement("a");
+      a.href = URL.createObjectURL(blob);
+      a.download = displayName(f.name);
+      document.body.appendChild(a); a.click(); a.remove();
+      setTimeout(() => URL.revokeObjectURL(a.href), 10000);
+    } catch (e) { alert("下載失敗:" + e.message); }
+    dl.disabled = false; dl.textContent = "下載";
+  };
+  const del = document.createElement("button");
+  del.className = "ghost danger"; del.textContent = "刪除";
+  del.onclick = async () => {
+    if (!confirm(`刪除「${displayName(f.name)}」?`)) return;
+    del.disabled = true;
+    try { await deletePath(f.path, f.sha); li.remove(); }
+    catch (e) { alert("刪除失敗:" + e.message); del.disabled = false; }
+  };
+  acts.append(dl, del);
+  li.append(info, acts);
+  return li;
+}
+async function uploadFiles(list) {
+  const files = Array.from(list);
+  let done = 0;
+  for (const f of files) {
+    if (f.size > MAX_BYTES) { setStatus($("fileStatus"), `「${f.name}」超過 50 MB,略過`, "err"); continue; }
+    setStatus($("fileStatus"), `上傳中(${done + 1}/${files.length}):${f.name}`);
+    try {
+      const b64 = bytesToB64(new Uint8Array(await f.arrayBuffer()));
+      const safe = f.name.replace(/[\\/]/g, "_");
+      await putFile(`files/${stamp()}_${safe}`, b64, "upload " + safe);
+      done++;
+    } catch (e) { setStatus($("fileStatus"), `「${f.name}」上傳失敗:${e.message}`, "err"); return loadFiles(); }
+  }
+  setStatus($("fileStatus"), `已上傳 ${done} 個檔案`, "ok");
+  loadFiles();
+}
+const drop = $("drop");
+drop.onclick = () => $("fileInput").click();
+$("fileInput").onchange = e => { uploadFiles(e.target.files); e.target.value = ""; };
+drop.addEventListener("dragover", e => { e.preventDefault(); drop.classList.add("over"); });
+drop.addEventListener("dragleave", () => drop.classList.remove("over"));
+drop.addEventListener("drop", e => { e.preventDefault(); drop.classList.remove("over"); uploadFiles(e.dataTransfer.files); });
+
+// ---------- 啟動 ----------
+const saved = readStored();
+let savedInLocal = false;
+try { savedInLocal = !!localStorage.getItem("drop_token"); } catch {}
+if (saved) tryLogin(saved, savedInLocal, true); else showLogin();
+</script>
+</body>
+</html>
