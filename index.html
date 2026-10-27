@@ -91,7 +91,7 @@
     <!-- 檔案 -->
     <section class="card">
       <h2>檔案</h2>
-      <div id="drop" class="drop">把 Word / Excel / PowerPoint 檔拖到這裡,或點這裡選檔<br><span class="muted">單檔上限 50 MB</span></div>
+      <div id="drop" class="drop">把 Word / Excel / PowerPoint 檔拖到這裡,或點這裡選檔<br><span class="muted">單檔上限 100 MB(超過 30 MB 會分段上傳,比較久)</span></div>
       <input id="fileInput" type="file" multiple class="hidden">
       <div id="fileStatus" class="status"></div>
       <ul id="files"></ul>
@@ -104,7 +104,10 @@
 const OWNER = "city2243";
 const REPO = "drop-storage";
 const API = `https://api.github.com/repos/${OWNER}/${REPO}/contents/`;
-const MAX_BYTES = 50 * 1024 * 1024;
+const MAX_BYTES = 100 * 1024 * 1024;
+// GitHub API 單次寫入實測約 38–40 MB 就回 422,大檔切成 30 MB 一段存,下載時接回
+const CHUNK_BYTES = 30 * 1024 * 1024;
+const PART_RE = /\.part(\d+)of(\d+)$/;
 const NOTES_PAGE = 30;
 
 const $ = id => document.getElementById(id);
@@ -161,6 +164,16 @@ function bytesToB64(bytes) {
     bin += String.fromCharCode.apply(null, bytes.subarray(i, i + chunk));
   }
   return btoa(bin);
+}
+
+// 用瀏覽器內建的 FileReader 轉 base64,大檔比逐字元拼字串省記憶體
+function blobToB64(blob) {
+  return new Promise((resolve, reject) => {
+    const r = new FileReader();
+    r.onload = () => resolve(r.result.slice(r.result.indexOf(",") + 1));
+    r.onerror = () => reject(r.error);
+    r.readAsDataURL(blob);
+  });
 }
 
 function stamp() {
@@ -296,12 +309,30 @@ $("noteInput").addEventListener("keydown", e => {
 // ---------- 檔案 ----------
 function displayName(name) { return name.replace(/^\d{8}-\d{6}_/, ""); }
 
+// 把分段檔(xxx.part1of4 …)合成一筆;沒分段的檔就是只有一段
+function groupFiles(items) {
+  const groups = new Map();
+  for (const it of items) {
+    const m = it.name.match(PART_RE);
+    const base = m ? it.name.replace(PART_RE, "") : it.name;
+    if (!groups.has(base)) groups.set(base, { name: base, parts: [], total: m ? Number(m[2]) : 1, size: 0 });
+    const g = groups.get(base);
+    g.parts.push({ ...it, idx: m ? Number(m[1]) : 1 });
+    g.size += it.size;
+  }
+  for (const g of groups.values()) {
+    g.parts.sort((a, b) => a.idx - b.idx);
+    g.complete = g.parts.length === g.total;
+  }
+  return [...groups.values()];
+}
+
 async function loadFiles() {
   $("files").innerHTML = '<li class="muted">載入中…</li>';
   try {
-    const items = await listDir("files");
-    $("files").innerHTML = items.length ? "" : '<li class="muted">還沒有檔案</li>';
-    items.forEach(f => $("files").appendChild(fileItem(f)));
+    const groups = groupFiles(await listDir("files"));
+    $("files").innerHTML = groups.length ? "" : '<li class="muted">還沒有檔案</li>';
+    groups.forEach(g => $("files").appendChild(fileItem(g)));
   } catch (e) { $("files").innerHTML = `<li class="status err">讀取失敗:${e.message}</li>`; }
 }
 function fileItem(f) {
@@ -311,16 +342,23 @@ function fileItem(f) {
   const name = document.createElement("div");
   name.className = "file-name"; name.textContent = displayName(f.name);
   const meta = document.createElement("div");
-  meta.className = "muted"; meta.textContent = `${stampLabel(f.name)} · ${prettySize(f.size)}`;
+  meta.className = "muted";
+  meta.textContent = `${stampLabel(f.name)} · ${prettySize(f.size)}` + (f.complete ? "" : ` · 上傳不完整(${f.parts.length}/${f.total} 段),請刪除後重傳`);
   info.append(name, meta);
   const acts = document.createElement("div");
   acts.className = "actions";
   const dl = document.createElement("button");
   dl.className = "ghost"; dl.textContent = "下載";
+  dl.disabled = !f.complete;
   dl.onclick = async () => {
     dl.disabled = true; dl.textContent = "下載中…";
     try {
-      const blob = await rawBlob(f.path);
+      const pieces = [];
+      for (const p of f.parts) {
+        if (f.parts.length > 1) dl.textContent = `下載中 ${p.idx}/${f.total}…`;
+        pieces.push(await rawBlob(p.path));
+      }
+      const blob = new Blob(pieces);
       const a = document.createElement("a");
       a.href = URL.createObjectURL(blob);
       a.download = displayName(f.name);
@@ -334,8 +372,11 @@ function fileItem(f) {
   del.onclick = async () => {
     if (!confirm(`刪除「${displayName(f.name)}」?`)) return;
     del.disabled = true;
-    try { await deletePath(f.path, f.sha); li.remove(); }
-    catch (e) { alert("刪除失敗:" + e.message); del.disabled = false; }
+    try {
+      // 每次刪除都是一個 commit,要依序刪,並行會撞版本衝突
+      for (const p of f.parts) await deletePath(p.path, p.sha);
+      li.remove();
+    } catch (e) { alert("刪除失敗:" + e.message); del.disabled = false; loadFiles(); }
   };
   acts.append(dl, del);
   li.append(info, acts);
@@ -345,12 +386,17 @@ async function uploadFiles(list) {
   const files = Array.from(list);
   let done = 0;
   for (const f of files) {
-    if (f.size > MAX_BYTES) { setStatus($("fileStatus"), `「${f.name}」超過 50 MB,略過`, "err"); continue; }
-    setStatus($("fileStatus"), `上傳中(${done + 1}/${files.length}):${f.name}`);
+    if (f.size > MAX_BYTES) { setStatus($("fileStatus"), `「${f.name}」超過 100 MB,略過`, "err"); continue; }
     try {
-      const b64 = bytesToB64(new Uint8Array(await f.arrayBuffer()));
       const safe = f.name.replace(/[\\/]/g, "_");
-      await putFile(`files/${stamp()}_${safe}`, b64, "upload " + safe);
+      const base = `files/${stamp()}_${safe}`;
+      const total = Math.max(1, Math.ceil(f.size / CHUNK_BYTES));
+      for (let i = 0; i < total; i++) {
+        setStatus($("fileStatus"), `上傳中(${done + 1}/${files.length}):${f.name}` + (total > 1 ? ` 第 ${i + 1}/${total} 段` : ""));
+        const b64 = await blobToB64(f.slice(i * CHUNK_BYTES, (i + 1) * CHUNK_BYTES));
+        const path = total > 1 ? `${base}.part${i + 1}of${total}` : base;
+        await putFile(path, b64, "upload " + safe + (total > 1 ? ` (${i + 1}/${total})` : ""));
+      }
       done++;
     } catch (e) { setStatus($("fileStatus"), `「${f.name}」上傳失敗:${e.message}`, "err"); return loadFiles(); }
   }
