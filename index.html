@@ -245,8 +245,8 @@ function prettySize(n) {
   return (n / 1024 / 1024 / 1024).toFixed(2) + " GB";
 }
 
-async function putFile(path, b64, message, onWait) {
-  return gh(path, { method: "PUT", body: JSON.stringify({ message, content: b64 }), onWait });
+async function putFile(path, b64, message, onWait, signal) {
+  return gh(path, { method: "PUT", body: JSON.stringify({ message, content: b64 }), onWait, signal });
 }
 async function deletePath(path, sha) {
   return gh(path, { method: "DELETE", body: JSON.stringify({ message: "delete " + path, sha }) });
@@ -399,7 +399,7 @@ async function refreshFiles() {
   const ul = $("files");
   try {
     // 正在上傳中的分段檔不列出來,免得看到「不完整」
-    const uploading = new Set(jobs.filter(j => j.state === "run" && j.base).map(j => j.base.replace(/^files\//, "")));
+    const uploading = new Set(jobs.filter(j => (j.state === "run" || j.state === "canceling") && j.base).map(j => j.base.replace(/^files\//, "")));
     const groups = groupFiles(await listDir("files")).filter(g => !uploading.has(g.name));
     ul.innerHTML = "";
     if (!groups.length) ul.appendChild(el("li", "muted", "還沒有檔案"));
@@ -491,7 +491,10 @@ function addFiles(files) {
     const info = el("div"); info.append(el("div", "file-name", f.name), job.msgEl);
     job.retry = el("button", "ghost hidden", "重試");
     job.retry.onclick = () => { job.state = "wait"; paint(job); pump(); };
-    top.append(info, job.retry);
+    job.cancel = el("button", "ghost danger", "取消");
+    job.cancel.onclick = () => cancelJob(job);
+    const acts = el("div", "actions"); acts.append(job.retry, job.cancel);
+    top.append(info, acts);
     job.bar = el("div", "bar"); job.bar.appendChild(el("i"));
     job.li.append(top, job.bar);
     $("queue").prepend(job.li);
@@ -505,7 +508,17 @@ function paint(job, pct) {
   const fill = job.bar.firstChild;
   job.bar.classList.remove("busy");
   job.retry.classList.toggle("hidden", job.state !== "fail" || job.file.size > MAX_BYTES);
-  if (job.state === "wait") {
+  job.cancel.classList.toggle("hidden", !["wait", "run", "fail"].includes(job.state));
+  if (job.state === "canceling") {
+    job.msgEl.className = "muted";
+    job.msgEl.textContent = `${size} · 取消中,正在清掉已上傳的部分…`;
+    job.bar.classList.add("busy");
+  } else if (job.state === "canceled") {
+    job.msgEl.className = "muted";
+    job.msgEl.textContent = `${size} · 已取消,沒有留下檔案`;
+    fill.style.width = "0";
+    setTimeout(() => job.li.remove(), 4000);
+  } else if (job.state === "wait") {
     job.msgEl.className = "muted";
     job.msgEl.textContent = `${size} · 排隊中`;
     fill.style.width = "0";
@@ -530,9 +543,9 @@ function paint(job, pct) {
 async function putWithRetry(path, b64, message, job, pct) {
   for (let attempt = 1; ; attempt++) {
     try {
-      return await putFile(path, b64, message, wait => { job.msg = `GitHub 要求放慢,等 ${wait} 秒後繼續…`; paint(job, pct); });
+      return await putFile(path, b64, message, wait => { job.msg = `GitHub 要求放慢,等 ${wait} 秒後繼續…`; paint(job, pct); }, job.ctrl.signal);
     } catch (e) {
-      if (/^401\b/.test(e.message)) throw e;
+      if (job.cancelled || /^401\b/.test(e.message)) throw e;
       if (await gh(path, { allow404: true }).catch(() => null)) return;
       if (attempt >= 4) throw e;
       job.msg = `GitHub 暫時出錯,第 ${attempt} 次自動重試…`;
@@ -556,6 +569,7 @@ async function uploadJob(job) {
   const started = Date.now();
   let sent = 0;
   for (let i = 0; i < job.total; i++) {
+    if (job.cancelled) throw new Error("已取消");
     const name = `${prefix}.part${i + 1}of${job.total}`;
     const pct = Math.floor(i / job.total * 100);
     const secs = (Date.now() - started) / 1000;
@@ -569,6 +583,29 @@ async function uploadJob(job) {
   }
 }
 
+// 拉錯檔時用:排隊中的直接拿掉;上傳中的中斷連線,再把已經傳上去的段刪乾淨
+async function cancelJob(job) {
+  job.cancelled = true;
+  if (job.state === "run") { job.ctrl?.abort(); return; }   // pump 接手清理
+  if (job.state === "wait") { job.state = "canceled"; paint(job); return; }
+  if (job.state === "fail") await cleanupJob(job);
+}
+async function cleanupJob(job) {
+  job.state = "canceling"; paint(job);
+  if (job.base) {
+    // 被中斷的那段可能在伺服器端剛好寫完,等一下再查
+    await sleep(2000);
+    const prefix = job.base.replace(/^files\//, "");
+    try {
+      const left = (await listDir("files")).filter(i => i.name === prefix || i.name.startsWith(prefix + ".part"));
+      for (const p of left) await deletePath(p.path, p.sha);
+      if (left.length) scheduleClean();
+    } catch (e) { console.warn("取消後清理失敗", e); }
+  }
+  job.state = "canceled"; paint(job);
+  refreshFiles();
+}
+
 async function pump() {
   if (pumping) return;
   pumping = true;
@@ -576,11 +613,12 @@ async function pump() {
     for (;;) {
       const job = jobs.find(j => j.state === "wait");
       if (!job) break;
-      job.state = "run"; job.msg = ""; paint(job);
+      job.state = "run"; job.msg = ""; job.ctrl = new AbortController(); paint(job);
       try {
         await uploadJob(job);
         job.state = "done";
       } catch (e) { job.state = "fail"; job.msg = e.message; }
+      if (job.cancelled) { await cleanupJob(job); continue; }
       paint(job);
       refreshFiles();   // 每存好一個就更新清單,不用等全部傳完
     }
