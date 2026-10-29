@@ -134,10 +134,13 @@ const OWNER = "city2243";
 const REPO = "drop-storage";
 const API = `https://api.github.com/repos/${OWNER}/${REPO}/contents/`;
 const GIT = `https://api.github.com/repos/${OWNER}/${REPO}/git/`;
-// GitHub API 單次寫入實測約 38–40 MB 就回 422,所以大檔切成 30 MB 一段(.partNofM),下載時接回
-const CHUNK_BYTES = 30 * 1024 * 1024;
+// GitHub API 單次寫入實測約 38–40 MB 就回 422;使用者的網路還會切斷大的上傳請求,所以大檔切小段送,
+// 段的大小自動調:斷線就減半(最小 1 MB),連續順利就加倍(最大 24 MB)。
+// 段的檔名記下位元組範圍(.p<起>-<迄>of<總長>),大小不同的段也能接回。
+const SMALL_MAX = 8 * 1024 * 1024;   // 這以下一次送完
+const CHUNK_START = 8 * 1024 * 1024, CHUNK_MIN = 1024 * 1024, CHUNK_MAX = 24 * 1024 * 1024;
 const MAX_BYTES = 10 * 1024 * 1024 * 1024;
-const PART_RE = /\.part(\d+)of(\d+)$/;
+const PART_RE = /\.p(\d+)-(\d+)of(\d+)$/;
 // 這裡是暫存區:刪掉的檔仍留在 git 歷史裡佔空間,所以刪檔後把歷史清成只剩一個 commit,GitHub 之後會回收
 const WARN_KB = 1024 * 1024;
 const NOTES_PAGE = 30;
@@ -189,7 +192,10 @@ async function ghFetch(url, opts = {}) {
       },
       cache: "no-store",
     });
-    const limited = res.status === 429 || (res.status === 403 && (res.headers.get("retry-after") || res.headers.get("x-ratelimit-remaining") === "0"));
+    let limited = res.status === 429 || (res.status === 403 && (res.headers.get("retry-after") || res.headers.get("x-ratelimit-remaining") === "0"));
+    if (res.status === 403 && !limited) {
+      try { limited = /secondary rate limit/i.test(await res.clone().text()); } catch {}
+    }
     if (limited && attempt < 5) {
       const wait = Number(res.headers.get("retry-after") || 60);
       opts.onWait?.(wait);
@@ -376,22 +382,36 @@ $("noteInput").addEventListener("keydown", e => {
 // ---------- 檔案清單 ----------
 function displayName(name) { return name.replace(/^\d{8}-\d{6}_/, ""); }
 
-// 把分段檔(xxx.part1of4 …)合成一筆;沒分段的檔就是只有一段
+// 用 git tree 列檔:目錄 API 最多只回 1000 筆,大檔切小段後會超過
+async function listFiles() {
+  const j = await (await ghFetch(GIT + "trees/main?recursive=1")).json();
+  return j.tree.filter(t => t.type === "blob" && t.path.startsWith("files/"))
+    .map(t => ({ name: t.path.slice(6), path: t.path, sha: t.sha, size: t.size }));
+}
+const isMine = (name, prefix) => name === prefix || (name.startsWith(prefix + ".p") && PART_RE.test(name));
+
+// 從 0 開始接得起來的位元組數
+function contiguousEnd(parts) {
+  let end = 0;
+  for (const p of parts) { if (p.start > end) break; end = Math.max(end, p.end); }
+  return end;
+}
+// 把分段檔(xxx.p0-8388608of20000000 …)合成一筆;沒分段的檔就是只有一段
 function groupFiles(items) {
   const groups = new Map();
   for (const it of items) {
     const m = it.name.match(PART_RE);
     const base = m ? it.name.replace(PART_RE, "") : it.name;
-    if (!groups.has(base)) groups.set(base, { name: base, parts: [], total: m ? Number(m[2]) : 1, size: 0 });
-    const g = groups.get(base);
-    g.parts.push({ ...it, idx: m ? Number(m[1]) : 1 });
-    g.size += it.size;
+    if (!groups.has(base)) groups.set(base, { name: base, parts: [], total: m ? Number(m[3]) : it.size });
+    groups.get(base).parts.push({ ...it, start: m ? Number(m[1]) : 0, end: m ? Number(m[2]) : it.size });
   }
   for (const g of groups.values()) {
-    g.parts.sort((a, b) => a.idx - b.idx);
-    g.complete = g.parts.length === g.total;
+    g.parts.sort((a, b) => a.start - b.start);
+    g.done = contiguousEnd(g.parts);
+    g.complete = g.done >= g.total;
+    g.size = g.total;
   }
-  return [...groups.values()];
+  return [...groups.values()].sort((a, b) => b.name.localeCompare(a.name));
 }
 
 async function refreshFiles() {
@@ -400,7 +420,7 @@ async function refreshFiles() {
   try {
     // 正在上傳中的分段檔不列出來,免得看到「不完整」
     const uploading = new Set(jobs.filter(j => (j.state === "run" || j.state === "canceling") && j.base).map(j => j.base.replace(/^files\//, "")));
-    const groups = groupFiles(await listDir("files")).filter(g => !uploading.has(g.name));
+    const groups = groupFiles(await listFiles()).filter(g => !uploading.has(g.name));
     ul.innerHTML = "";
     if (!groups.length) ul.appendChild(el("li", "muted", "還沒有檔案"));
     groups.forEach(g => ul.appendChild(fileItem(g)));
@@ -420,6 +440,17 @@ async function loadUsage() {
 }
 
 // 有「另存新檔」功能的瀏覽器(Chrome、Edge)邊下載邊寫進硬碟,幾 GB 的檔也不會吃光記憶體
+// 依位元組位置一段段讀回來;萬一段之間有重疊(重送時可能發生),只取還沒拿到的那截
+async function eachPiece(f, onStep, use) {
+  let cursor = 0;
+  for (const p of f.parts) {
+    if (p.end <= cursor) continue;
+    onStep(Math.floor(cursor / f.total * 100));
+    const blob = await rawBlob(p.path);
+    await use(blob.slice(cursor - p.start));
+    cursor = p.end;
+  }
+}
 async function downloadParts(f, onStep) {
   const name = displayName(f.name);
   if (window.showSaveFilePicker && f.parts.length > 1) {
@@ -428,16 +459,13 @@ async function downloadParts(f, onStep) {
     catch (e) { if (e.name === "AbortError") return false; throw e; }
     const out = await handle.createWritable();
     try {
-      for (const p of f.parts) {
-        onStep(p.idx);
-        await out.write(await rawBlob(p.path));
-      }
+      await eachPiece(f, onStep, b => out.write(b));
       await out.close();
     } catch (e) { await out.abort().catch(() => {}); throw e; }
     return true;
   }
   const pieces = [];
-  for (const p of f.parts) { onStep(p.idx); pieces.push(await rawBlob(p.path)); }
+  await eachPiece(f, onStep, b => { pieces.push(b); });
   const a = document.createElement("a");
   a.href = URL.createObjectURL(new Blob(pieces));
   a.download = name;
@@ -449,14 +477,14 @@ async function downloadParts(f, onStep) {
 function fileItem(f) {
   const li = el("li", "file-row");
   const info = el("div");
-  const meta = `${timeLabel(stampDate(f.name))} · ${prettySize(f.size)}` + (f.complete ? "" : ` · 上傳不完整(${f.parts.length}/${f.total} 段),請刪除後重傳`);
+  const meta = `${timeLabel(stampDate(f.name))} · ${prettySize(f.size)}` + (f.complete ? "" : ` · 上傳不完整(只傳了 ${prettySize(f.done)}),請刪除後重傳`);
   info.append(el("div", "file-name", displayName(f.name)), el("div", "muted", meta));
   const acts = el("div", "actions");
   const dl = el("button", "ghost", "下載");
   dl.disabled = !f.complete;
   dl.onclick = async () => {
     dl.disabled = true; dl.textContent = "下載中…";
-    try { await downloadParts(f, i => { if (f.total > 1) dl.textContent = `下載中 ${i}/${f.total}…`; }); }
+    try { await downloadParts(f, pct => { if (f.parts.length > 1) dl.textContent = `下載中 ${pct}%…`; }); }
     catch (e) { alert("下載失敗:" + e.message); }
     dl.disabled = false; dl.textContent = "下載";
   };
@@ -483,7 +511,7 @@ let pumping = false;
 
 function addFiles(files) {
   for (const f of files) {
-    const job = { file: f, state: "wait", msg: "", total: Math.max(1, Math.ceil(f.size / CHUNK_BYTES)) };
+    const job = { file: f, state: "wait", msg: "", chunked: f.size > SMALL_MAX };
     if (f.size > MAX_BYTES) { job.state = "fail"; job.msg = "超過 10 GB,無法上傳"; }
     job.li = el("li");
     const top = el("div", "file-row");
@@ -533,24 +561,36 @@ function paint(job, pct) {
     setTimeout(() => job.li.remove(), 8000);
   } else {
     job.msgEl.className = "err";
-    job.msgEl.textContent = `${size} · 失敗:${job.msg}` + (job.total > 1 && job.base ? "(按重試會從斷掉的那段接著傳)" : "");
+    job.msgEl.textContent = `${size} · 失敗:${job.msg}` + (job.chunked && job.base ? "(按重試會從斷掉的地方接著傳)" : "");
     fill.style.width = "0";
   }
 }
 
-// GitHub 偶爾回暫時性錯誤(實測 403「The rule did not run because of a timeout」),自動重送;
+const waitOnline = () => navigator.onLine ? Promise.resolve()
+  : new Promise(r => window.addEventListener("online", r, { once: true }));
+const exists = path => gh(path, { allow404: true }).then(r => !!r).catch(() => false);
+const MAX_FAILS = 15;   // 連續失敗這麼多次才放棄(每次等愈來愈久,大約十分鐘)
+
+// 送一段;斷線、GitHub 暫時出錯(實測 403「The rule did not run because of a timeout」)都自動重送。
 // 重送前先查那段是不是其實已經寫進去了,免得重複寫撞 422
-async function putWithRetry(path, b64, message, job, pct) {
-  for (let attempt = 1; ; attempt++) {
+async function sendPiece(path, blob, message, job, pct, onFail) {
+  for (;;) {
     try {
-      return await putFile(path, b64, message, wait => { job.msg = `GitHub 要求放慢,等 ${wait} 秒後繼續…`; paint(job, pct); }, job.ctrl.signal);
+      await putFile(path, await blobToB64(blob), message,
+        wait => { job.msg = `GitHub 要求放慢,等 ${wait} 秒後繼續…`; paint(job, pct); }, job.ctrl.signal);
+      job.fails = 0;
+      return;
     } catch (e) {
       if (job.cancelled || /^401\b/.test(e.message)) throw e;
-      if (await gh(path, { allow404: true }).catch(() => null)) return;
-      if (attempt >= 4) throw e;
-      job.msg = `GitHub 暫時出錯,第 ${attempt} 次自動重試…`;
+      if (await exists(path)) { job.fails = 0; return; }
+      job.fails = (job.fails || 0) + 1;
+      if (job.fails > MAX_FAILS) throw new Error("網路一直斷,先暫停。網路穩了再按重試,會從斷掉的地方接著傳");
+      if (onFail && onFail()) throw Object.assign(new Error("resize"), { resize: true });
+      const wait = Math.min(30, 3 * job.fails);
+      job.msg = `連線斷了,${navigator.onLine ? wait + " 秒後" : "等網路恢復後"}自動重試(第 ${job.fails} 次)…`;
       paint(job, pct);
-      await sleep(5000 * attempt);
+      await waitOnline();
+      await sleep(wait * 1000);
     }
   }
 }
@@ -559,27 +599,42 @@ async function uploadJob(job) {
   const f = job.file;
   const safe = f.name.replace(/[\\/]/g, "_");
   if (!job.base) job.base = `files/${stamp()}_${safe}`;
-  if (job.total === 1) {
-    await putWithRetry(job.base, await blobToB64(f), "upload " + safe, job);
+  if (!job.chunked) {
+    await sendPiece(job.base, f, "upload " + safe, job);
     return;
   }
-  // 重試時跳過已經傳上去的段
+  // 重試時從已經接得起來的地方繼續
   const prefix = job.base.replace(/^files\//, "");
-  const have = new Set((await listDir("files")).filter(i => i.name.startsWith(prefix + ".part")).map(i => i.name));
-  const started = Date.now();
-  let sent = 0;
-  for (let i = 0; i < job.total; i++) {
+  const mine = groupFiles((await listFiles()).filter(i => isMine(i.name, prefix)))[0];
+  let offset = mine ? mine.done : 0;
+  // ceil:這次上傳中曾經失敗過的段大小,之後放大不超過它,免得在斷線邊緣反覆試
+  let chunk = job.chunk || CHUNK_START, ceil = job.ceil || CHUNK_MAX * 2, streak = 0;
+  const started = Date.now(), from = offset;
+  while (offset < f.size) {
     if (job.cancelled) throw new Error("已取消");
-    const name = `${prefix}.part${i + 1}of${job.total}`;
-    const pct = Math.floor(i / job.total * 100);
+    const end = Math.min(offset + chunk, f.size);
+    const pct = Math.floor(offset / f.size * 100);
     const secs = (Date.now() - started) / 1000;
-    const speed = sent && secs > 1 ? ` · ${prettySize(sent / secs)}/秒` : "";
-    job.msg = `第 ${i + 1}/${job.total} 段 ${pct}%${speed}`;
+    const speed = offset > from && secs > 1 ? ` · ${prettySize((offset - from) / secs)}/秒` : "";
+    job.msg = `${pct}%(${prettySize(offset)} / ${prettySize(f.size)})${speed}`;
     paint(job, pct);
-    if (have.has(name)) continue;
-    const piece = f.slice(i * CHUNK_BYTES, (i + 1) * CHUNK_BYTES);
-    await putWithRetry("files/" + name, await blobToB64(piece), `upload ${safe} (${i + 1}/${job.total})`, job, pct);
-    sent += piece.size;
+    try {
+      // 第一次失敗就改用小一半的段重來,太大的請求是最常被網路切掉的
+      await sendPiece(`files/${prefix}.p${offset}-${end}of${f.size}`, f.slice(offset, end),
+        `upload ${safe} ${pct}%`, job, pct, () => chunk > CHUNK_MIN);
+      offset = end;
+      if (++streak >= 3 && chunk * 2 <= CHUNK_MAX && chunk * 2 < ceil) { chunk *= 2; streak = 0; }
+    } catch (e) {
+      if (!e.resize) throw e;
+      ceil = job.ceil = chunk;
+      chunk = Math.max(CHUNK_MIN, Math.floor(chunk / 2));
+      streak = 0;
+      job.msg = `連線斷了,改用 ${prettySize(chunk)} 的小段重送…`;
+      paint(job, pct);
+      await waitOnline();
+      await sleep(2000);
+    }
+    job.chunk = chunk;
   }
 }
 
@@ -597,7 +652,7 @@ async function cleanupJob(job) {
     await sleep(2000);
     const prefix = job.base.replace(/^files\//, "");
     try {
-      const left = (await listDir("files")).filter(i => i.name === prefix || i.name.startsWith(prefix + ".part"));
+      const left = (await listFiles()).filter(i => isMine(i.name, prefix));
       for (const p of left) await deletePath(p.path, p.sha);
       if (left.length) scheduleClean();
     } catch (e) { console.warn("取消後清理失敗", e); }
