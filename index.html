@@ -264,8 +264,10 @@ async function listDir(dir) {
   return items.filter(i => i.type === "file" && i.name !== ".keep")
               .sort((a, b) => b.name.localeCompare(a.name));
 }
-async function rawBlob(path) {
-  const res = await gh(path, { accept: "application/vnd.github.raw" });
+// 用 git blob 讀原始內容:contents 的 raw 會把看起來像文字的小檔「轉編碼」
+// (實測 321 bytes 的隨機資料被當成 UTF-16 轉成 478 bytes),blob 則原封不動
+async function rawBlob(item) {
+  const res = await ghFetch(GIT + "blobs/" + item.sha, { accept: "application/vnd.github.raw" });
   return res.blob();
 }
 
@@ -355,7 +357,7 @@ async function loadNotes() {
 async function showMoreNotes() {
   const batch = noteEntries.slice(notesShown, notesShown + NOTES_PAGE);
   notesShown += batch.length;
-  const texts = await Promise.all(batch.map(n => rawBlob(n.path).then(b => b.text()).catch(() => "(讀取失敗)")));
+  const texts = await Promise.all(batch.map(n => rawBlob(n).then(b => b.text()).catch(() => "(讀取失敗)")));
   batch.forEach((n, i) => $("notes").appendChild(noteItem(n, texts[i])));
   $("moreNotes").classList.toggle("hidden", notesShown >= noteEntries.length);
 }
@@ -466,7 +468,7 @@ async function eachPiece(f, onStep, use) {
   for (const p of f.parts) {
     if (p.end <= cursor) continue;
     onStep(Math.floor(cursor / f.total * 100));
-    const blob = await rawBlob(p.path);
+    const blob = await rawBlob(p);
     await use(blob.slice(cursor - p.start));
     cursor = p.end;
   }
