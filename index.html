@@ -269,6 +269,26 @@ async function rawBlob(path) {
   return res.blob();
 }
 
+// 一次刪掉很多個檔(一個大檔的所有段):只做一個 commit,不用一段一段刪
+async function deletePaths(paths, message) {
+  for (let attempt = 1; ; attempt++) {
+    const ref = await (await ghFetch(GIT + "ref/heads/main")).json();
+    const head = await (await ghFetch(GIT + "commits/" + ref.object.sha)).json();
+    const tree = await (await ghFetch(GIT + "trees", {
+      method: "POST",
+      body: JSON.stringify({ base_tree: head.tree.sha, tree: paths.map(path => ({ path, mode: "100644", type: "blob", sha: null })) }),
+    })).json();
+    const commit = await (await ghFetch(GIT + "commits", {
+      method: "POST", body: JSON.stringify({ message, tree: tree.sha, parents: [head.sha] }),
+    })).json();
+    try {
+      // 不強制:這中間若有別的檔剛上傳完,main 已經往前,就重新來過,免得把它蓋掉
+      await ghFetch(GIT + "refs/heads/main", { method: "PATCH", body: JSON.stringify({ sha: commit.sha }) });
+      return;
+    } catch (e) { if (attempt >= 5) throw e; await sleep(1000 * attempt); }
+  }
+}
+
 // ---------- 清歷史:main 換成一個沒有上一代的 commit(檔案不變) ----------
 let cleanTimer = null;
 function scheduleClean() {
@@ -493,8 +513,7 @@ function fileItem(f) {
     if (!confirm(`刪除「${displayName(f.name)}」?`)) return;
     del.disabled = true; del.textContent = "刪除中…";
     try {
-      // 每次刪除都是一個 commit,要依序刪,並行會撞版本衝突
-      for (const p of f.parts) await deletePath(p.path, p.sha);
+      await deletePaths(f.parts.map(p => p.path), "delete " + displayName(f.name));
       li.remove();
       if (!$("files").children.length) $("files").appendChild(el("li", "muted", "還沒有檔案"));
       scheduleClean();
@@ -608,7 +627,7 @@ async function uploadJob(job) {
   const mine = groupFiles((await listFiles()).filter(i => isMine(i.name, prefix)))[0];
   let offset = mine ? mine.done : 0;
   // ceil:這次上傳中曾經失敗過的段大小,之後放大不超過它,免得在斷線邊緣反覆試
-  let chunk = job.chunk || CHUNK_START, ceil = job.ceil || CHUNK_MAX * 2, streak = 0;
+  let chunk = job.chunk || CHUNK_START, ceil = job.ceil || CHUNK_MAX * 2, streak = 0, sameSize = 0;
   const started = Date.now(), from = offset;
   while (offset < f.size) {
     if (job.cancelled) throw new Error("已取消");
@@ -619,16 +638,17 @@ async function uploadJob(job) {
     job.msg = `${pct}%(${prettySize(offset)} / ${prettySize(f.size)})${speed}`;
     paint(job, pct);
     try {
-      // 第一次失敗就改用小一半的段重來,太大的請求是最常被網路切掉的
+      // 同一個大小連續斷兩次就改用小一半的段:太大的請求是最常被網路切掉的,偶發斷一次則照原大小重送
       await sendPiece(`files/${prefix}.p${offset}-${end}of${f.size}`, f.slice(offset, end),
-        `upload ${safe} ${pct}%`, job, pct, () => chunk > CHUNK_MIN);
+        `upload ${safe} ${pct}%`, job, pct, () => ++sameSize >= 2 && chunk > CHUNK_MIN);
       offset = end;
+      sameSize = 0;
       if (++streak >= 3 && chunk * 2 <= CHUNK_MAX && chunk * 2 < ceil) { chunk *= 2; streak = 0; }
     } catch (e) {
       if (!e.resize) throw e;
       ceil = job.ceil = chunk;
       chunk = Math.max(CHUNK_MIN, Math.floor(chunk / 2));
-      streak = 0;
+      streak = 0; sameSize = 0;
       job.msg = `連線斷了,改用 ${prettySize(chunk)} 的小段重送…`;
       paint(job, pct);
       await waitOnline();
@@ -653,8 +673,7 @@ async function cleanupJob(job) {
     const prefix = job.base.replace(/^files\//, "");
     try {
       const left = (await listFiles()).filter(i => isMine(i.name, prefix));
-      for (const p of left) await deletePath(p.path, p.sha);
-      if (left.length) scheduleClean();
+      if (left.length) { await deletePaths(left.map(p => p.path), "cancel upload " + prefix); scheduleClean(); }
     } catch (e) { console.warn("取消後清理失敗", e); }
   }
   job.state = "canceled"; paint(job);
