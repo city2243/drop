@@ -5,18 +5,17 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="robots" content="noindex, nofollow">
 <title>我的收件匣</title>
-<script src="https://accounts.google.com/gsi/client" async></script>
 <style>
   :root {
     --bg: #f6f7f9; --card: #ffffff; --text: #1d2330; --muted: #6b7280;
-    --line: #e3e6eb; --accent: #2563eb; --accent-soft: #e8efff; --accent-text: #ffffff;
-    --danger: #c0392b; --ok: #15803d; --warn-bg: #fff7e0; --warn-line: #f1d48a;
+    --line: #e3e6eb; --accent: #2563eb; --accent-text: #ffffff;
+    --danger: #c0392b; --ok: #15803d;
   }
   @media (prefers-color-scheme: dark) {
     :root {
       --bg: #14171c; --card: #1d2128; --text: #e6e8eb; --muted: #9aa3ae;
-      --line: #2e333b; --accent: #4f8cff; --accent-soft: #1d2a45; --accent-text: #ffffff;
-      --danger: #ef6b5b; --ok: #4ade80; --warn-bg: #2e2716; --warn-line: #6b5a2a;
+      --line: #2e333b; --accent: #4f8cff; --accent-text: #ffffff;
+      --danger: #ef6b5b; --ok: #4ade80;
     }
   }
   * { box-sizing: border-box; }
@@ -38,9 +37,9 @@
     font: inherit; border: 0; border-radius: 8px; padding: 8px 16px; cursor: pointer;
     background: var(--accent); color: var(--accent-text);
   }
-  button.ghost, a.ghost {
+  button.ghost {
     background: transparent; color: var(--muted); border: 1px solid var(--line);
-    padding: 4px 10px; font-size: 14px; border-radius: 8px; text-decoration: none; cursor: pointer;
+    padding: 4px 10px; font-size: 14px;
   }
   button.danger { color: var(--danger); }
   button:disabled { opacity: .5; cursor: default; }
@@ -52,7 +51,7 @@
 
   .drop {
     border: 2px dashed var(--line); border-radius: 12px; padding: 36px 16px; text-align: center;
-    color: var(--muted); cursor: pointer; transition: background .15s, border-color .15s;
+    color: var(--muted); cursor: pointer; transition: border-color .15s;
   }
   .drop:hover { border-color: var(--accent); }
   .drop .big { font-size: 18px; color: var(--text); margin-bottom: 4px; }
@@ -68,11 +67,6 @@
     padding: 40px 48px; font-size: 22px; pointer-events: none; text-align: center;
   }
 
-  .need-g {
-    background: var(--warn-bg); border: 1px solid var(--warn-line); border-radius: 10px;
-    padding: 12px; margin-top: 12px; display: flex; gap: 10px; align-items: center; justify-content: space-between; flex-wrap: wrap;
-  }
-
   ul { list-style: none; margin: 12px 0 0; padding: 0; }
   li { border-top: 1px solid var(--line); padding: 10px 0; }
   #queue li:first-child { border-top: 0; }
@@ -80,7 +74,6 @@
   .file-row { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
   .file-name { word-break: break-all; }
   .actions { display: flex; gap: 6px; flex-shrink: 0; align-items: center; }
-  .tag { font-size: 12px; padding: 0 6px; border-radius: 6px; background: var(--accent-soft); color: var(--accent); margin-left: 6px; white-space: nowrap; }
   .bar { height: 6px; background: var(--line); border-radius: 3px; overflow: hidden; margin-top: 6px; }
   .bar i { display: block; height: 100%; width: 0; background: var(--accent); transition: width .3s; }
   .bar.busy i { width: 35%; animation: slide 1.2s ease-in-out infinite; }
@@ -109,23 +102,14 @@
   <div id="app" class="hidden">
     <!-- 檔案 -->
     <section class="card">
-      <div class="card-head">
-        <h2>檔案</h2>
-        <span><span id="gStatus" class="muted"></span> <button id="gLogin" class="ghost">連結 Google 雲端硬碟</button></span>
-      </div>
+      <div class="card-head"><h2>檔案(暫存)</h2></div>
       <div id="drop" class="drop">
         <div class="big">把檔案拖進這個視窗任何地方就存好</div>
         也可以點這裡選檔,或按 Ctrl+V 貼上檔案<br>
-        <span class="muted">30 MB 以下存 GitHub;更大的(最大 10 GB)存到 Google 雲端硬碟「收件匣大檔」</span>
+        <span class="muted">單檔最大 10 GB;超過 30 MB 會分段上傳,比較久</span>
       </div>
       <input id="fileInput" type="file" multiple class="hidden">
-
-      <div id="needG" class="need-g hidden">
-        <span id="needGText">有大檔要存到 Google 雲端硬碟</span>
-        <button id="needGBtn">連結 Google 並開始上傳</button>
-      </div>
       <ul id="queue"></ul>
-
       <ul id="files"></ul>
       <div id="usage" class="muted" style="margin-top:8px"></div>
     </section>
@@ -149,21 +133,13 @@
 const OWNER = "city2243";
 const REPO = "drop-storage";
 const API = `https://api.github.com/repos/${OWNER}/${REPO}/contents/`;
-// GitHub 建議 repo 小於 1 GB、最好別超過 5 GB;刪掉的檔仍留在歷史,所以要顯示已用量
-const WARN_KB = 1024 * 1024;
-// GitHub API 單次寫入實測約 38–40 MB 就回 422;超過這個大小的檔改存 Google 雲端硬碟。
-// 舊版曾把大檔切成 .partNofM 存,列表與下載仍認得。
-const SMALL_MAX = 30 * 1024 * 1024;
-
-// Google 雲端硬碟(大檔)。用戶端 ID 是公開識別碼,不是秘密。
-// drive.file 權限只看得到這個網頁自己建的檔,碰不到雲端硬碟裡其他東西。
-const G_CLIENT_ID = "223483846838-pb0tgrcda86fgahe5jvandt8e2b5i2ai.apps.googleusercontent.com";
-const G_SCOPE = "https://www.googleapis.com/auth/drive.file";
-const G_FOLDER = "收件匣大檔";
-const G_MAX = 10 * 1024 * 1024 * 1024;
-const G_CHUNK = 64 * 1024 * 1024;   // 續傳分段,必須是 256 KB 的倍數
-const G_FILES = "https://www.googleapis.com/drive/v3/files";
+const GIT = `https://api.github.com/repos/${OWNER}/${REPO}/git/`;
+// GitHub API 單次寫入實測約 38–40 MB 就回 422,所以大檔切成 30 MB 一段(.partNofM),下載時接回
+const CHUNK_BYTES = 30 * 1024 * 1024;
+const MAX_BYTES = 10 * 1024 * 1024 * 1024;
 const PART_RE = /\.part(\d+)of(\d+)$/;
+// 這裡是暫存區:刪掉的檔仍留在 git 歷史裡佔空間,所以刪檔後把歷史清成只剩一個 commit,GitHub 之後會回收
+const WARN_KB = 1024 * 1024;
 const NOTES_PAGE = 30;
 
 const $ = id => document.getElementById(id);
@@ -184,9 +160,9 @@ function forget() {
   try { localStorage.removeItem("drop_token"); sessionStorage.removeItem("drop_token"); } catch {}
 }
 
-function setStatus(el, msg, kind) {
-  el.textContent = msg;
-  el.className = "status" + (kind ? " " + kind : "");
+function setStatus(node, msg, kind) {
+  node.textContent = msg;
+  node.className = "status" + (kind ? " " + kind : "");
 }
 function el(tag, cls, text) {
   const e = document.createElement(tag);
@@ -194,30 +170,42 @@ function el(tag, cls, text) {
   if (text != null) e.textContent = text;
   return e;
 }
+const sleep = ms => new Promise(r => setTimeout(r, ms));
 
 function encPath(path) {
   return path.split("/").map(encodeURIComponent).join("/");
 }
 
-async function gh(path, opts = {}) {
-  const res = await fetch(API + encPath(path), {
-    ...opts,
-    headers: {
-      "Authorization": "Bearer " + token,
-      "Accept": opts.accept || "application/vnd.github+json",
-      "X-GitHub-Api-Version": "2022-11-28",
-      ...(opts.body ? { "Content-Type": "application/json" } : {}),
-    },
-    cache: "no-store",
-  });
-  if (res.status === 404 && opts.allow404) return null;
-  if (!res.ok) {
-    let msg = res.status + " " + res.statusText;
-    try { const j = await res.json(); if (j.message) msg = res.status + " " + j.message; } catch {}
-    throw new Error(msg);
+async function ghFetch(url, opts = {}) {
+  // GitHub 寫太快會回 403/429(次級速率限制),等一下再送
+  for (let attempt = 0; ; attempt++) {
+    const res = await fetch(url, {
+      ...opts,
+      headers: {
+        "Authorization": "Bearer " + token,
+        "Accept": opts.accept || "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+        ...(opts.body ? { "Content-Type": "application/json" } : {}),
+      },
+      cache: "no-store",
+    });
+    const limited = res.status === 429 || (res.status === 403 && (res.headers.get("retry-after") || res.headers.get("x-ratelimit-remaining") === "0"));
+    if (limited && attempt < 5) {
+      const wait = Number(res.headers.get("retry-after") || 60);
+      opts.onWait?.(wait);
+      await sleep(wait * 1000);
+      continue;
+    }
+    if (res.status === 404 && opts.allow404) return null;
+    if (!res.ok) {
+      let msg = res.status + " " + res.statusText;
+      try { const j = await res.json(); if (j.message) msg = res.status + " " + j.message; } catch {}
+      throw new Error(msg);
+    }
+    return res;
   }
-  return res;
 }
+const gh = (path, opts) => ghFetch(API + encPath(path), opts);
 
 function bytesToB64(bytes) {
   let bin = "";
@@ -257,8 +245,8 @@ function prettySize(n) {
   return (n / 1024 / 1024 / 1024).toFixed(2) + " GB";
 }
 
-async function putFile(path, b64, message) {
-  return gh(path, { method: "PUT", body: JSON.stringify({ message, content: b64 }) });
+async function putFile(path, b64, message, onWait) {
+  return gh(path, { method: "PUT", body: JSON.stringify({ message, content: b64 }), onWait });
 }
 async function deletePath(path, sha) {
   return gh(path, { method: "DELETE", body: JSON.stringify({ message: "delete " + path, sha }) });
@@ -273,6 +261,27 @@ async function listDir(dir) {
 async function rawBlob(path) {
   const res = await gh(path, { accept: "application/vnd.github.raw" });
   return res.blob();
+}
+
+// ---------- 清歷史:main 換成一個沒有上一代的 commit(檔案不變) ----------
+let cleanTimer = null;
+function scheduleClean() {
+  clearTimeout(cleanTimer);
+  cleanTimer = setTimeout(cleanHistory, 3000);
+}
+async function cleanHistory() {
+  // 還有檔在上傳就先不清,等傳完再說
+  if (pumping || jobs.some(j => j.state === "wait" || j.state === "run")) return scheduleClean();
+  try {
+    const ref = await (await ghFetch(GIT + "ref/heads/main")).json();
+    const head = await (await ghFetch(GIT + "commits/" + ref.object.sha)).json();
+    if (!head.parents.length) return;   // 已經只剩一個 commit
+    const fresh = await (await ghFetch(GIT + "commits", {
+      method: "POST", body: JSON.stringify({ message: "清理暫存歷史(只保留目前的檔案)", tree: head.tree.sha }),
+    })).json();
+    await ghFetch(GIT + "refs/heads/main", { method: "PATCH", body: JSON.stringify({ sha: fresh.sha, force: true }) });
+  } catch (e) { console.warn("清歷史失敗", e); }
+  loadUsage();
 }
 
 // ---------- 登入 ----------
@@ -290,7 +299,6 @@ async function tryLogin(t, remember, quiet) {
     $("login").classList.add("hidden");
     $("app").classList.remove("hidden");
     $("logout").classList.remove("hidden");
-    if (G_CLIENT_ID && gRestoreToken()) gAfterLogin();
     loadNotes(); refreshFiles();
   } catch (e) {
     token = "";
@@ -339,17 +347,13 @@ function noteItem(n, text) {
   del.onclick = async () => {
     if (!confirm("刪除這則文字?")) return;
     del.disabled = true;
-    try { await deletePath(n.path, n.sha); li.remove(); }
+    try { await deletePath(n.path, n.sha); li.remove(); scheduleClean(); }
     catch (e) { alert("刪除失敗:" + e.message); del.disabled = false; }
   };
   acts.append(copy, del);
   row.append(el("span", "muted", timeLabel(stampDate(n.name))), acts);
   li.append(el("p", "note-text", text), row);
   return li;
-}
-async function saveNote(text) {
-  const b64 = bytesToB64(new TextEncoder().encode(text));
-  await putFile(`notes/${stamp()}.txt`, b64, "add note");
 }
 $("moreNotes").onclick = showMoreNotes;
 $("saveNote").onclick = async () => {
@@ -358,7 +362,7 @@ $("saveNote").onclick = async () => {
   $("saveNote").disabled = true;
   setStatus($("noteStatus"), "儲存中…");
   try {
-    await saveNote(text);
+    await putFile(`notes/${stamp()}.txt`, bytesToB64(new TextEncoder().encode(text)), "add note");
     $("noteInput").value = "";
     setStatus($("noteStatus"), "已儲存", "ok");
     loadNotes();
@@ -369,7 +373,7 @@ $("noteInput").addEventListener("keydown", e => {
   if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) $("saveNote").click();
 });
 
-// ---------- 檔案清單(GitHub 小檔 + 雲端硬碟大檔合成一張,新到舊) ----------
+// ---------- 檔案清單 ----------
 function displayName(name) { return name.replace(/^\d{8}-\d{6}_/, ""); }
 
 // 把分段檔(xxx.part1of4 …)合成一筆;沒分段的檔就是只有一段
@@ -390,30 +394,17 @@ function groupFiles(items) {
   return [...groups.values()];
 }
 
-let ghGroups = [], gList = null, filesErr = "";
 async function refreshFiles() {
   loadUsage();
-  filesErr = "";
-  await Promise.all([
-    listDir("files").then(items => { ghGroups = groupFiles(items); })
-      .catch(e => { filesErr += "GitHub 讀取失敗:" + e.message + " "; }),
-    gTokenValid()
-      ? gListFiles().then(l => { gList = l; }).catch(e => { gList = null; filesErr += "雲端硬碟讀取失敗:" + e.message; })
-      : Promise.resolve(gList = null),
-  ]);
-  renderFiles();
-}
-function renderFiles() {
-  const rows = [
-    ...ghGroups.map(g => ({ t: stampDate(g.name), li: () => fileItem(g) })),
-    ...(gList || []).map(f => ({ t: new Date(f.createdTime), li: () => gFileItem(f) })),
-  ].sort((a, b) => b.t - a.t);
   const ul = $("files");
-  ul.innerHTML = "";
-  if (filesErr) ul.appendChild(el("li", "status err", filesErr));
-  if (!rows.length && !filesErr) ul.appendChild(el("li", "muted", "還沒有檔案"));
-  rows.forEach(r => ul.appendChild(r.li()));
-  if (gList === null && G_CLIENT_ID) ul.appendChild(el("li", "muted", "存在 Google 雲端硬碟的大檔,要按右上角「連結 Google 雲端硬碟」才會列出來"));
+  try {
+    // 正在上傳中的分段檔不列出來,免得看到「不完整」
+    const uploading = new Set(jobs.filter(j => j.state === "run" && j.base).map(j => j.base.replace(/^files\//, "")));
+    const groups = groupFiles(await listDir("files")).filter(g => !uploading.has(g.name));
+    ul.innerHTML = "";
+    if (!groups.length) ul.appendChild(el("li", "muted", "還沒有檔案"));
+    groups.forEach(g => ul.appendChild(fileItem(g)));
+  } catch (e) { ul.innerHTML = ""; ul.appendChild(el("li", "status err", "讀取失敗:" + e.message)); }
 }
 
 async function loadUsage() {
@@ -423,9 +414,36 @@ async function loadUsage() {
     });
     const kb = (await res.json()).size;
     const u = $("usage");
-    u.textContent = `GitHub 空間已用約 ${prettySize(kb * 1024)}(含已刪除檔案的歷史,建議 1 GB 以內)`;
+    u.textContent = `空間已用約 ${prettySize(kb * 1024)}(刪掉的檔要等 GitHub 回收,可能要幾小時)`;
     u.className = kb > WARN_KB ? "status err" : "muted";
   } catch {}
+}
+
+// 有「另存新檔」功能的瀏覽器(Chrome、Edge)邊下載邊寫進硬碟,幾 GB 的檔也不會吃光記憶體
+async function downloadParts(f, onStep) {
+  const name = displayName(f.name);
+  if (window.showSaveFilePicker && f.parts.length > 1) {
+    let handle;
+    try { handle = await showSaveFilePicker({ suggestedName: name }); }
+    catch (e) { if (e.name === "AbortError") return false; throw e; }
+    const out = await handle.createWritable();
+    try {
+      for (const p of f.parts) {
+        onStep(p.idx);
+        await out.write(await rawBlob(p.path));
+      }
+      await out.close();
+    } catch (e) { await out.abort().catch(() => {}); throw e; }
+    return true;
+  }
+  const pieces = [];
+  for (const p of f.parts) { onStep(p.idx); pieces.push(await rawBlob(p.path)); }
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(new Blob(pieces));
+  a.download = name;
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(a.href), 60000);
+  return true;
 }
 
 function fileItem(f) {
@@ -438,56 +456,23 @@ function fileItem(f) {
   dl.disabled = !f.complete;
   dl.onclick = async () => {
     dl.disabled = true; dl.textContent = "下載中…";
-    try {
-      const pieces = [];
-      for (const p of f.parts) {
-        if (f.parts.length > 1) dl.textContent = `下載中 ${p.idx}/${f.total}…`;
-        pieces.push(await rawBlob(p.path));
-      }
-      const a = document.createElement("a");
-      a.href = URL.createObjectURL(new Blob(pieces));
-      a.download = displayName(f.name);
-      document.body.appendChild(a); a.click(); a.remove();
-      setTimeout(() => URL.revokeObjectURL(a.href), 10000);
-    } catch (e) { alert("下載失敗:" + e.message); }
+    try { await downloadParts(f, i => { if (f.total > 1) dl.textContent = `下載中 ${i}/${f.total}…`; }); }
+    catch (e) { alert("下載失敗:" + e.message); }
     dl.disabled = false; dl.textContent = "下載";
   };
   const del = el("button", "ghost danger", "刪除");
   del.onclick = async () => {
     if (!confirm(`刪除「${displayName(f.name)}」?`)) return;
-    del.disabled = true;
+    del.disabled = true; del.textContent = "刪除中…";
     try {
       // 每次刪除都是一個 commit,要依序刪,並行會撞版本衝突
       for (const p of f.parts) await deletePath(p.path, p.sha);
-      ghGroups = ghGroups.filter(g => g !== f);
       li.remove();
-    } catch (e) { alert("刪除失敗:" + e.message); del.disabled = false; refreshFiles(); }
+      if (!$("files").children.length) $("files").appendChild(el("li", "muted", "還沒有檔案"));
+      scheduleClean();
+    } catch (e) { alert("刪除失敗:" + e.message); refreshFiles(); }
   };
   acts.append(dl, del);
-  li.append(info, acts);
-  return li;
-}
-function gFileItem(f) {
-  const li = el("li", "file-row");
-  const info = el("div");
-  const name = el("div", "file-name", f.name);
-  name.appendChild(el("span", "tag", "雲端硬碟"));
-  info.append(name, el("div", "muted", `${timeLabel(new Date(f.createdTime))} · ${prettySize(Number(f.size || 0))}`));
-  const acts = el("div", "actions");
-  // 大檔交給雲端硬碟自己的下載,瀏覽器不用把整個檔塞進記憶體
-  const open = el("a", "ghost", "開啟/下載");
-  open.href = f.webViewLink; open.target = "_blank"; open.rel = "noopener";
-  const del = el("button", "ghost danger", "刪除");
-  del.onclick = async () => {
-    if (!confirm(`把「${f.name}」移到雲端硬碟的垃圾桶?(30 天內可救回)`)) return;
-    del.disabled = true;
-    try {
-      await gApi(`${G_FILES}/${f.id}`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ trashed: true }) });
-      gList = (gList || []).filter(x => x !== f);
-      li.remove();
-    } catch (e) { alert("刪除失敗:" + e.message); del.disabled = false; }
-  };
-  acts.append(open, del);
   li.append(info, acts);
   return li;
 }
@@ -498,13 +483,12 @@ let pumping = false;
 
 function addFiles(files) {
   for (const f of files) {
-    const job = { file: f, big: f.size > SMALL_MAX, state: "wait", msg: "" };
-    if (f.size > G_MAX) { job.state = "fail"; job.msg = "超過 10 GB,無法上傳"; }
+    const job = { file: f, state: "wait", msg: "", total: Math.max(1, Math.ceil(f.size / CHUNK_BYTES)) };
+    if (f.size > MAX_BYTES) { job.state = "fail"; job.msg = "超過 10 GB,無法上傳"; }
     job.li = el("li");
     const top = el("div", "file-row");
-    job.nameEl = el("div", "file-name", f.name);
     job.msgEl = el("div", "muted");
-    const info = el("div"); info.append(job.nameEl, job.msgEl);
+    const info = el("div"); info.append(el("div", "file-name", f.name), job.msgEl);
     job.retry = el("button", "ghost hidden", "重試");
     job.retry.onclick = () => { job.state = "wait"; paint(job); pump(); };
     top.append(info, job.retry);
@@ -518,184 +502,73 @@ function addFiles(files) {
 }
 function paint(job, pct) {
   const size = prettySize(job.file.size);
-  const where = job.big ? "雲端硬碟" : "GitHub";
   const fill = job.bar.firstChild;
   job.bar.classList.remove("busy");
-  job.retry.classList.toggle("hidden", job.state !== "fail" || job.file.size > G_MAX);
+  job.retry.classList.toggle("hidden", job.state !== "fail" || job.file.size > MAX_BYTES);
   if (job.state === "wait") {
     job.msgEl.className = "muted";
-    job.msgEl.textContent = job.big && !gTokenValid() ? `${size} · 等待連結 Google…` : `${size} · 排隊中`;
+    job.msgEl.textContent = `${size} · 排隊中`;
     fill.style.width = "0";
   } else if (job.state === "run") {
     job.msgEl.className = "muted";
-    job.msgEl.textContent = `${size} · 上傳到${where}… ${job.msg}`;
+    job.msgEl.textContent = `${size} · 上傳中… ${job.msg}`;
     if (pct == null) job.bar.classList.add("busy"); else fill.style.width = pct + "%";
   } else if (job.state === "done") {
     job.msgEl.className = "ok";
-    job.msgEl.textContent = `${size} · 已存到${where} ✓`;
+    job.msgEl.textContent = `${size} · 已存好 ✓`;
     fill.style.width = "100%";
     setTimeout(() => job.li.remove(), 8000);
   } else {
     job.msgEl.className = "err";
-    job.msgEl.textContent = `${size} · 失敗:${job.msg}`;
+    job.msgEl.textContent = `${size} · 失敗:${job.msg}` + (job.total > 1 && job.base ? "(按重試會從斷掉的那段接著傳)" : "");
     fill.style.width = "0";
   }
 }
-function updateNeedG() {
-  const n = jobs.filter(j => j.state === "wait" && j.big).length;
-  const show = n > 0 && !gTokenValid();
-  $("needG").classList.toggle("hidden", !show);
-  if (show) $("needGText").textContent = `有 ${n} 個大檔(超過 30 MB)要存到 Google 雲端硬碟,要先連結一次`;
+
+async function uploadJob(job) {
+  const f = job.file;
+  const safe = f.name.replace(/[\\/]/g, "_");
+  if (!job.base) job.base = `files/${stamp()}_${safe}`;
+  if (job.total === 1) {
+    await putFile(job.base, await blobToB64(f), "upload " + safe);
+    return;
+  }
+  // 重試時跳過已經傳上去的段
+  const prefix = job.base.replace(/^files\//, "");
+  const have = new Set((await listDir("files")).filter(i => i.name.startsWith(prefix + ".part")).map(i => i.name));
+  const started = Date.now();
+  let sent = 0;
+  for (let i = 0; i < job.total; i++) {
+    const name = `${prefix}.part${i + 1}of${job.total}`;
+    const pct = Math.floor(i / job.total * 100);
+    const secs = (Date.now() - started) / 1000;
+    const speed = sent && secs > 1 ? ` · ${prettySize(sent / secs)}/秒` : "";
+    job.msg = `第 ${i + 1}/${job.total} 段 ${pct}%${speed}`;
+    paint(job, pct);
+    if (have.has(name)) continue;
+    const piece = f.slice(i * CHUNK_BYTES, (i + 1) * CHUNK_BYTES);
+    await putFile("files/" + name, await blobToB64(piece), `upload ${safe} (${i + 1}/${job.total})`,
+      wait => { job.msg = `GitHub 要求放慢,等 ${wait} 秒後繼續…`; paint(job, pct); });
+    sent += piece.size;
+  }
 }
+
 async function pump() {
   if (pumping) return;
   pumping = true;
   try {
     for (;;) {
-      const job = jobs.find(j => j.state === "wait" && (!j.big || gTokenValid()));
+      const job = jobs.find(j => j.state === "wait");
       if (!job) break;
       job.state = "run"; job.msg = ""; paint(job);
       try {
-        if (job.big) {
-          await gUpload(job.file, (pct, msg) => { job.msg = msg; paint(job, pct); });
-        } else {
-          const safe = job.file.name.replace(/[\\/]/g, "_");
-          await putFile(`files/${stamp()}_${safe}`, await blobToB64(job.file), "upload " + safe);
-        }
+        await uploadJob(job);
         job.state = "done";
-        refreshFiles();   // 每存好一個就更新清單,不用等全部傳完
       } catch (e) { job.state = "fail"; job.msg = e.message; }
       paint(job);
+      refreshFiles();   // 每存好一個就更新清單,不用等全部傳完
     }
   } finally { pumping = false; }
-  jobs.filter(j => j.state === "wait").forEach(j => paint(j));
-  updateNeedG();
-}
-
-// ---------- Google 雲端硬碟(大檔) ----------
-let gToken = "", gExpiry = 0, gClient = null, gFolderId = "";
-
-function gTokenValid() { return !!gToken && Date.now() < gExpiry; }
-// 只能在使用者「點擊」的當下呼叫:瀏覽器會擋掉拖放或程式觸發的彈出視窗
-function gRequestToken(prompt) {
-  return new Promise((resolve, reject) => {
-    if (!G_CLIENT_ID) return reject(new Error("還沒設定 Google 用戶端 ID"));
-    if (!window.google?.accounts?.oauth2) return reject(new Error("Google 登入元件還沒載入,稍後再試"));
-    if (!gClient) gClient = google.accounts.oauth2.initTokenClient({ client_id: G_CLIENT_ID, scope: G_SCOPE, callback: () => {} });
-    gClient.callback = r => {
-      if (r.error) return reject(new Error(r.error_description || r.error));
-      gToken = r.access_token;
-      gExpiry = Date.now() + (Number(r.expires_in) - 120) * 1000;
-      try { sessionStorage.setItem("drop_gtoken", JSON.stringify({ t: gToken, e: gExpiry })); } catch {}
-      resolve();
-    };
-    gClient.error_callback = e => reject(new Error(
-      e.type === "popup_closed" ? "Google 登入視窗被關掉了" :
-      e.type === "popup_failed_to_open" ? "瀏覽器擋住了 Google 登入視窗,請允許這個網站開彈出視窗" :
-      "Google 登入失敗:" + (e.type || "")));
-    gClient.requestAccessToken({ prompt });
-  });
-}
-function gRestoreToken() {
-  try {
-    const s = JSON.parse(sessionStorage.getItem("drop_gtoken") || "null");
-    if (s && Date.now() < s.e) { gToken = s.t; gExpiry = s.e; return true; }
-  } catch {}
-  return false;
-}
-function gAfterLogin() {
-  $("gLogin").textContent = "重新連結";
-  $("gStatus").textContent = "Google 已連結";
-  $("gStatus").className = "ok";
-  // 權杖約 1 小時後失效,到期時把狀態改回來,大檔會改成等待連結
-  clearTimeout(gAfterLogin.t);
-  gAfterLogin.t = setTimeout(() => {
-    $("gLogin").textContent = "連結 Google 雲端硬碟";
-    $("gStatus").textContent = "";
-    updateNeedG();
-  }, Math.max(0, gExpiry - Date.now()));
-}
-function gConnect() {
-  return gRequestToken(gTokenValid() ? "" : "select_account")
-    .then(() => { gAfterLogin(); updateNeedG(); pump(); refreshFiles(); })
-    .catch(e => { $("gStatus").textContent = e.message; $("gStatus").className = "err"; });
-}
-$("gLogin").onclick = gConnect;
-$("needGBtn").onclick = gConnect;
-
-async function gApi(url, opts = {}) {
-  if (!gTokenValid()) throw new Error("Google 連結已過期,請重新連結");
-  const res = await fetch(url, { ...opts, headers: { "Authorization": "Bearer " + gToken, ...(opts.headers || {}) } });
-  if (!res.ok) {
-    let msg = String(res.status);
-    try { const j = await res.json(); if (j.error?.message) msg += " " + j.error.message; } catch {}
-    if (res.status === 401) { gToken = ""; msg = "Google 連結已過期,請重新連結"; }
-    throw new Error(msg);
-  }
-  return res;
-}
-async function gFolder() {
-  if (gFolderId) return gFolderId;
-  const q = encodeURIComponent(`name='${G_FOLDER}' and mimeType='application/vnd.google-apps.folder' and trashed=false`);
-  const found = await (await gApi(`${G_FILES}?q=${q}&fields=files(id)`)).json();
-  if (found.files.length) return gFolderId = found.files[0].id;
-  const made = await (await gApi(`${G_FILES}?fields=id`, {
-    method: "POST", headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ name: G_FOLDER, mimeType: "application/vnd.google-apps.folder" }),
-  })).json();
-  return gFolderId = made.id;
-}
-async function gListFiles() {
-  const q = encodeURIComponent(`'${await gFolder()}' in parents and trashed=false`);
-  const j = await (await gApi(`${G_FILES}?q=${q}&orderBy=createdTime%20desc&pageSize=200&fields=files(id,name,size,createdTime,webViewLink)`)).json();
-  return j.files;
-}
-
-// 續傳上傳:先開一個上傳工作,再每 64 MB 送一段;斷線就問伺服器收到哪裡,從那裡接著送
-async function gUpload(f, onProgress) {
-  const init = await gApi("https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable&fields=id", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json; charset=UTF-8",
-      "X-Upload-Content-Length": String(f.size),
-      "X-Upload-Content-Type": f.type || "application/octet-stream",
-    },
-    body: JSON.stringify({ name: f.name, parents: [await gFolder()] }),
-  });
-  const session = init.headers.get("Location");
-  if (!session) throw new Error("拿不到上傳網址");
-  const auth = () => gTokenValid() ? { "Authorization": "Bearer " + gToken } : {};
-  const nextOffset = (res, fallback) => {
-    const r = res.headers.get("Range");
-    return r ? Number(r.split("-")[1]) + 1 : fallback;
-  };
-  const started = Date.now();
-  let offset = 0, tries = 0;
-  while (true) {
-    const end = Math.min(offset + G_CHUNK, f.size);
-    const secs = (Date.now() - started) / 1000;
-    const speed = secs > 1 ? ` · ${prettySize(offset / secs)}/秒` : "";
-    const pct = Math.floor(offset / f.size * 100);
-    onProgress(pct, `${pct}%${speed}`);
-    let res = null;
-    try {
-      res = await fetch(session, {
-        method: "PUT",
-        headers: { ...auth(), "Content-Range": `bytes ${offset}-${end - 1}/${f.size}` },
-        body: f.slice(offset, end),
-      });
-    } catch {}
-    if (res && (res.status === 200 || res.status === 201)) return res.json();
-    if (res && res.status === 308) { offset = nextOffset(res, end); tries = 0; continue; }
-    if (res && (res.status === 404 || res.status === 410)) throw new Error("上傳工作已失效,請重試");
-    if (++tries > 6) throw new Error("上傳中斷" + (res ? `(${res.status})` : "(網路)"));
-    await new Promise(r => setTimeout(r, 2000 * tries));
-    try {
-      const q = await fetch(session, { method: "PUT", headers: { ...auth(), "Content-Range": `bytes */${f.size}` } });
-      if (q.status === 200 || q.status === 201) return q.json();
-      if (q.status === 308) offset = nextOffset(q, 0);
-    } catch {}
-  }
 }
 
 // ---------- 拖放、選檔、貼上 ----------
@@ -736,9 +609,12 @@ document.addEventListener("paste", e => {
   const files = [...(e.clipboardData?.files || [])];
   if (files.length) { e.preventDefault(); addFiles(files); }
 });
+// 還在上傳就關分頁會中斷,先提醒
+window.addEventListener("beforeunload", e => {
+  if (jobs.some(j => j.state === "run" || j.state === "wait")) { e.preventDefault(); e.returnValue = ""; }
+});
 
 // ---------- 啟動 ----------
-if (!G_CLIENT_ID) $("gLogin").classList.add("hidden");
 const saved = readStored();
 let savedInLocal = false;
 try { savedInLocal = !!localStorage.getItem("drop_token"); } catch {}
