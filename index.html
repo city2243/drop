@@ -5,6 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="robots" content="noindex, nofollow">
 <title>我的收件匣</title>
+<script src="https://accounts.google.com/gsi/client" async></script>
 <style>
   :root {
     --bg: #f6f7f9; --card: #ffffff; --text: #1d2330; --muted: #6b7280;
@@ -91,11 +92,21 @@
     <!-- 檔案 -->
     <section class="card">
       <h2>檔案</h2>
-      <div id="drop" class="drop">把 Word / Excel / PowerPoint 檔拖到這裡,或點這裡選檔<br><span class="muted">單檔上限 500 MB(超過 30 MB 會分段上傳,比較久)</span></div>
+      <div id="drop" class="drop">把 Word / Excel / PowerPoint 檔拖到這裡,或點這裡選檔<br><span class="muted">30 MB 以下存這裡;超過 30 MB(最大 10 GB)存到你的 Google 雲端硬碟「收件匣大檔」資料夾</span></div>
       <div id="usage" class="muted"></div>
       <input id="fileInput" type="file" multiple class="hidden">
       <div id="fileStatus" class="status"></div>
       <ul id="files"></ul>
+    </section>
+
+    <!-- 大檔:Google 雲端硬碟 -->
+    <section class="card">
+      <h2>大檔(Google 雲端硬碟)</h2>
+      <div class="row" style="margin-top:0">
+        <button id="gLogin" class="ghost">連結 Google 雲端硬碟</button>
+        <span id="gStatus" class="status"></span>
+      </div>
+      <ul id="gfiles"></ul>
     </section>
   </div>
 </main>
@@ -105,11 +116,19 @@
 const OWNER = "city2243";
 const REPO = "drop-storage";
 const API = `https://api.github.com/repos/${OWNER}/${REPO}/contents/`;
-const MAX_BYTES = 500 * 1024 * 1024;
 // GitHub 建議 repo 小於 1 GB、最好別超過 5 GB;刪掉的檔仍留在歷史,所以要顯示已用量
 const WARN_KB = 1024 * 1024;
-// GitHub API 單次寫入實測約 38–40 MB 就回 422,大檔切成 30 MB 一段存,下載時接回
+// GitHub API 單次寫入實測約 38–40 MB 就回 422;超過這個大小的檔改存 Google 雲端硬碟。
+// 舊版曾把大檔切成 .partNofM 存,列表與下載仍認得。
 const CHUNK_BYTES = 30 * 1024 * 1024;
+
+// Google 雲端硬碟(大檔)。用戶端 ID 是公開識別碼,不是秘密。
+// drive.file 權限只看得到這個網頁自己建的檔,碰不到雲端硬碟裡其他東西。
+const G_CLIENT_ID = "";
+const G_SCOPE = "https://www.googleapis.com/auth/drive.file";
+const G_FOLDER = "收件匣大檔";
+const G_MAX = 10 * 1024 * 1024 * 1024;
+const G_CHUNK = 64 * 1024 * 1024;   // 續傳分段,必須是 256 KB 的倍數
 const PART_RE = /\.part(\d+)of(\d+)$/;
 const NOTES_PAGE = 30;
 
@@ -227,6 +246,7 @@ async function tryLogin(t, remember, quiet) {
     $("app").classList.remove("hidden");
     $("logout").classList.remove("hidden");
     loadNotes(); loadFiles();
+    if (G_CLIENT_ID && gRestoreToken()) { gAfterLogin(); gLoadFiles(); }
   } catch (e) {
     token = "";
     if (quiet) forget();
@@ -400,25 +420,184 @@ function fileItem(f) {
 }
 async function uploadFiles(list) {
   const files = Array.from(list);
-  let done = 0;
+  const anyBig = files.some(f => f.size > CHUNK_BYTES);
+  // Google 登入視窗必須在使用者點擊/拖放的當下開,所以在任何 await 之前先要
+  const gReady = anyBig && !gTokenValid() ? gRequestToken("").then(gAfterLogin) : Promise.resolve();
+  let done = 0, sentBig = false;
   for (const f of files) {
-    if (f.size > MAX_BYTES) { setStatus($("fileStatus"), `「${f.name}」超過 500 MB,略過`, "err"); continue; }
+    const status = `上傳中(${done + 1}/${files.length}):${f.name}`;
     try {
-      const safe = f.name.replace(/[\\/]/g, "_");
-      const base = `files/${stamp()}_${safe}`;
-      const total = Math.max(1, Math.ceil(f.size / CHUNK_BYTES));
-      for (let i = 0; i < total; i++) {
-        setStatus($("fileStatus"), `上傳中(${done + 1}/${files.length}):${f.name}` + (total > 1 ? ` 第 ${i + 1}/${total} 段` : ""));
-        const b64 = await blobToB64(f.slice(i * CHUNK_BYTES, (i + 1) * CHUNK_BYTES));
-        const path = total > 1 ? `${base}.part${i + 1}of${total}` : base;
-        await putFile(path, b64, "upload " + safe + (total > 1 ? ` (${i + 1}/${total})` : ""));
+      if (f.size > G_MAX) { setStatus($("fileStatus"), `「${f.name}」超過 10 GB,略過`, "err"); continue; }
+      if (f.size > CHUNK_BYTES) {
+        await gReady;
+        await gUpload(f, msg => setStatus($("fileStatus"), `${status} ${msg}`));
+        sentBig = true;
+      } else {
+        setStatus($("fileStatus"), status);
+        const safe = f.name.replace(/[\\/]/g, "_");
+        await putFile(`files/${stamp()}_${safe}`, await blobToB64(f), "upload " + safe);
       }
       done++;
-    } catch (e) { setStatus($("fileStatus"), `「${f.name}」上傳失敗:${e.message}`, "err"); return loadFiles(); }
+    } catch (e) {
+      setStatus($("fileStatus"), `「${f.name}」上傳失敗:${e.message}`, "err");
+      loadFiles(); if (sentBig) gLoadFiles();
+      return;
+    }
   }
   setStatus($("fileStatus"), `已上傳 ${done} 個檔案`, "ok");
-  loadFiles();
+  loadFiles(); if (sentBig) gLoadFiles();
 }
+
+// ---------- Google 雲端硬碟(大檔) ----------
+let gToken = "", gExpiry = 0, gClient = null, gFolderId = "";
+
+function gTokenValid() { return gToken && Date.now() < gExpiry; }
+function gRequestToken(prompt) {
+  return new Promise((resolve, reject) => {
+    if (!G_CLIENT_ID) return reject(new Error("還沒設定 Google 用戶端 ID"));
+    if (!window.google?.accounts?.oauth2) return reject(new Error("Google 登入元件還沒載入,稍後再試"));
+    if (!gClient) gClient = google.accounts.oauth2.initTokenClient({ client_id: G_CLIENT_ID, scope: G_SCOPE, callback: () => {} });
+    gClient.callback = r => {
+      if (r.error) return reject(new Error(r.error_description || r.error));
+      gToken = r.access_token;
+      gExpiry = Date.now() + (Number(r.expires_in) - 120) * 1000;
+      try { sessionStorage.setItem("drop_gtoken", JSON.stringify({ t: gToken, e: gExpiry })); } catch {}
+      resolve();
+    };
+    gClient.error_callback = e => reject(new Error(e.type === "popup_closed" ? "Google 登入視窗被關掉了" : "Google 登入失敗:" + (e.type || "")));
+    gClient.requestAccessToken({ prompt });
+  });
+}
+function gRestoreToken() {
+  try {
+    const s = JSON.parse(sessionStorage.getItem("drop_gtoken") || "null");
+    if (s && Date.now() < s.e) { gToken = s.t; gExpiry = s.e; return true; }
+  } catch {}
+  return false;
+}
+function gAfterLogin() {
+  $("gLogin").textContent = "重新連結";
+  setStatus($("gStatus"), "已連結", "ok");
+}
+
+async function gApi(url, opts = {}) {
+  if (!gTokenValid()) throw new Error("Google 連結已過期,請按「重新連結」");
+  const res = await fetch(url, { ...opts, headers: { "Authorization": "Bearer " + gToken, ...(opts.headers || {}) } });
+  if (!res.ok) {
+    let msg = String(res.status);
+    try { const j = await res.json(); if (j.error?.message) msg += " " + j.error.message; } catch {}
+    if (res.status === 401) { gToken = ""; msg = "Google 連結已過期,請按「重新連結」"; }
+    throw new Error(msg);
+  }
+  return res;
+}
+const G_FILES = "https://www.googleapis.com/drive/v3/files";
+
+async function gFolder() {
+  if (gFolderId) return gFolderId;
+  const q = encodeURIComponent(`name='${G_FOLDER}' and mimeType='application/vnd.google-apps.folder' and trashed=false`);
+  const found = await (await gApi(`${G_FILES}?q=${q}&fields=files(id)`)).json();
+  if (found.files.length) return gFolderId = found.files[0].id;
+  const made = await (await gApi(`${G_FILES}?fields=id`, {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ name: G_FOLDER, mimeType: "application/vnd.google-apps.folder" }),
+  })).json();
+  return gFolderId = made.id;
+}
+
+async function gLoadFiles() {
+  $("gfiles").innerHTML = '<li class="muted">載入中…</li>';
+  try {
+    const q = encodeURIComponent(`'${await gFolder()}' in parents and trashed=false`);
+    const j = await (await gApi(`${G_FILES}?q=${q}&orderBy=createdTime%20desc&pageSize=200&fields=files(id,name,size,createdTime,webViewLink)`)).json();
+    $("gfiles").innerHTML = j.files.length ? "" : '<li class="muted">還沒有大檔</li>';
+    j.files.forEach(f => $("gfiles").appendChild(gFileItem(f)));
+  } catch (e) { $("gfiles").innerHTML = `<li class="status err">讀取失敗:${e.message}</li>`; }
+}
+function gFileItem(f) {
+  const li = document.createElement("li");
+  li.className = "file-row";
+  const info = document.createElement("div");
+  const name = document.createElement("div");
+  name.className = "file-name"; name.textContent = f.name;
+  const meta = document.createElement("div");
+  meta.className = "muted";
+  meta.textContent = `${new Date(f.createdTime).toLocaleString("zh-TW", { hour12: false })} · ${prettySize(Number(f.size || 0))}`;
+  info.append(name, meta);
+  const acts = document.createElement("div");
+  acts.className = "actions";
+  // 大檔交給雲端硬碟自己的下載,瀏覽器不用把整個檔塞進記憶體
+  const open = document.createElement("a");
+  open.className = "ghost"; open.textContent = "開啟/下載";
+  open.href = f.webViewLink; open.target = "_blank"; open.rel = "noopener";
+  open.style.cssText = "border:1px solid var(--line);border-radius:8px;padding:4px 10px;font-size:14px;text-decoration:none";
+  const del = document.createElement("button");
+  del.className = "ghost danger"; del.textContent = "刪除";
+  del.onclick = async () => {
+    if (!confirm(`把「${f.name}」移到雲端硬碟的垃圾桶?(30 天內可救回)`)) return;
+    del.disabled = true;
+    try {
+      await gApi(`${G_FILES}/${f.id}`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ trashed: true }) });
+      li.remove();
+    } catch (e) { alert("刪除失敗:" + e.message); del.disabled = false; }
+  };
+  acts.append(open, del);
+  li.append(info, acts);
+  return li;
+}
+
+// 續傳上傳:先開一個上傳工作,再每 64 MB 送一段;斷線就問伺服器收到哪裡,從那裡接著送
+async function gUpload(f, onProgress) {
+  const init = await gApi("https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable&fields=id", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json; charset=UTF-8",
+      "X-Upload-Content-Length": String(f.size),
+      "X-Upload-Content-Type": f.type || "application/octet-stream",
+    },
+    body: JSON.stringify({ name: f.name, parents: [await gFolder()] }),
+  });
+  const session = init.headers.get("Location");
+  if (!session) throw new Error("拿不到上傳網址");
+  const auth = () => gTokenValid() ? { "Authorization": "Bearer " + gToken } : {};
+  const nextOffset = (res, fallback) => {
+    const r = res.headers.get("Range");
+    return r ? Number(r.split("-")[1]) + 1 : fallback;
+  };
+  const started = Date.now();
+  let offset = 0, tries = 0;
+  while (true) {
+    const end = Math.min(offset + G_CHUNK, f.size);
+    const secs = (Date.now() - started) / 1000;
+    const speed = secs > 1 ? ` · ${prettySize(offset / secs)}/秒` : "";
+    onProgress(`${Math.floor(offset / f.size * 100)}%(${prettySize(offset)} / ${prettySize(f.size)}${speed})`);
+    let res = null;
+    try {
+      res = await fetch(session, {
+        method: "PUT",
+        headers: { ...auth(), "Content-Range": `bytes ${offset}-${end - 1}/${f.size}` },
+        body: f.slice(offset, end),
+      });
+    } catch {}
+    if (res && (res.status === 200 || res.status === 201)) return res.json();
+    if (res && res.status === 308) { offset = nextOffset(res, end); tries = 0; continue; }
+    if (res && (res.status === 404 || res.status === 410)) throw new Error("上傳工作已失效,請重傳");
+    if (++tries > 6) throw new Error("上傳中斷" + (res ? `(${res.status})` : "(網路)"));
+    await new Promise(r => setTimeout(r, 2000 * tries));
+    try {
+      const q = await fetch(session, { method: "PUT", headers: { ...auth(), "Content-Range": `bytes */${f.size}` } });
+      if (q.status === 200 || q.status === 201) return q.json();
+      if (q.status === 308) offset = nextOffset(q, 0);
+    } catch {}
+  }
+}
+
+$("gLogin").onclick = () => {
+  gRequestToken(gTokenValid() ? "" : "select_account")
+    .then(() => { gAfterLogin(); gLoadFiles(); })
+    .catch(e => setStatus($("gStatus"), e.message, "err"));
+};
+if (!G_CLIENT_ID) { $("gLogin").disabled = true; setStatus($("gStatus"), "尚未設定(要先建立 Google 用戶端 ID)"); }
 const drop = $("drop");
 drop.onclick = () => $("fileInput").click();
 $("fileInput").onchange = e => { uploadFiles(e.target.files); e.target.value = ""; };
