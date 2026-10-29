@@ -525,12 +525,29 @@ function paint(job, pct) {
   }
 }
 
+// GitHub 偶爾回暫時性錯誤(實測 403「The rule did not run because of a timeout」),自動重送;
+// 重送前先查那段是不是其實已經寫進去了,免得重複寫撞 422
+async function putWithRetry(path, b64, message, job, pct) {
+  for (let attempt = 1; ; attempt++) {
+    try {
+      return await putFile(path, b64, message, wait => { job.msg = `GitHub 要求放慢,等 ${wait} 秒後繼續…`; paint(job, pct); });
+    } catch (e) {
+      if (/^401\b/.test(e.message)) throw e;
+      if (await gh(path, { allow404: true }).catch(() => null)) return;
+      if (attempt >= 4) throw e;
+      job.msg = `GitHub 暫時出錯,第 ${attempt} 次自動重試…`;
+      paint(job, pct);
+      await sleep(5000 * attempt);
+    }
+  }
+}
+
 async function uploadJob(job) {
   const f = job.file;
   const safe = f.name.replace(/[\\/]/g, "_");
   if (!job.base) job.base = `files/${stamp()}_${safe}`;
   if (job.total === 1) {
-    await putFile(job.base, await blobToB64(f), "upload " + safe);
+    await putWithRetry(job.base, await blobToB64(f), "upload " + safe, job);
     return;
   }
   // 重試時跳過已經傳上去的段
@@ -547,8 +564,7 @@ async function uploadJob(job) {
     paint(job, pct);
     if (have.has(name)) continue;
     const piece = f.slice(i * CHUNK_BYTES, (i + 1) * CHUNK_BYTES);
-    await putFile("files/" + name, await blobToB64(piece), `upload ${safe} (${i + 1}/${job.total})`,
-      wait => { job.msg = `GitHub 要求放慢,等 ${wait} 秒後繼續…`; paint(job, pct); });
+    await putWithRetry("files/" + name, await blobToB64(piece), `upload ${safe} (${i + 1}/${job.total})`, job, pct);
     sent += piece.size;
   }
 }
