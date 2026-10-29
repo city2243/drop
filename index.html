@@ -550,7 +550,6 @@ function updateNeedG() {
 async function pump() {
   if (pumping) return;
   pumping = true;
-  let changed = false;
   try {
     for (;;) {
       const job = jobs.find(j => j.state === "wait" && (!j.big || gTokenValid()));
@@ -564,14 +563,13 @@ async function pump() {
           await putFile(`files/${stamp()}_${safe}`, await blobToB64(job.file), "upload " + safe);
         }
         job.state = "done";
-        changed = true;
+        refreshFiles();   // 每存好一個就更新清單,不用等全部傳完
       } catch (e) { job.state = "fail"; job.msg = e.message; }
       paint(job);
     }
   } finally { pumping = false; }
   jobs.filter(j => j.state === "wait").forEach(j => paint(j));
   updateNeedG();
-  if (changed) refreshFiles();
 }
 
 // ---------- Google 雲端硬碟(大檔) ----------
