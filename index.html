@@ -633,7 +633,9 @@ function paint(job, pct) {
 const waitOnline = () => navigator.onLine ? Promise.resolve()
   : new Promise(r => window.addEventListener("online", r, { once: true }));
 const exists = path => gh(path, { allow404: true }).then(r => !!r).catch(() => false);
-const MAX_FAILS = 15;   // 連續失敗這麼多次才放棄(每次等愈來愈久,大約十分鐘)
+// 連續失敗幾次後改成「慢速等待」:每 2 分鐘試一次、不放棄。
+// 11-02 兩次都是傳到約 25 MB 就被使用者的網路擋住約一小時,之後又通(推測是網路端的上傳量限制)
+const QUICK_FAILS = 6, SLOW_WAIT_S = 120;
 
 // 送一段;斷線、GitHub 暫時出錯(實測 403「The rule did not run because of a timeout」)都自動重送。
 // 重送前先查那段是不是其實已經寫進去了,免得重複寫撞 422
@@ -648,13 +650,19 @@ async function sendPiece(path, blob, message, job, pct, onFail, onProgress) {
       if (job.cancelled || /^401\b/.test(e.message)) throw e;
       if (await exists(path)) { job.fails = 0; return; }
       job.fails = (job.fails || 0) + 1;
-      if (job.fails > MAX_FAILS) throw new Error("網路一直斷,先暫停。網路穩了再按重試,會從斷掉的地方接著傳");
       if (onFail && onFail()) throw Object.assign(new Error("resize"), { resize: true });
-      const wait = Math.min(30, 3 * job.fails);
-      job.msg = `連線斷了,${navigator.onLine ? wait + " 秒後" : "等網路恢復後"}自動重試(第 ${job.fails} 次)…`;
-      paint(job, pct);
+      const slow = job.fails > QUICK_FAILS;
+      const wait = slow ? SLOW_WAIT_S : Math.min(30, 3 * job.fails);
       await waitOnline();
-      await sleep(wait * 1000);
+      // 倒數顯示,讓人知道網頁還在等、沒有當掉
+      for (let left = wait; left > 0; left--) {
+        if (job.cancelled) throw new Error("已取消");
+        job.msg = slow
+          ? `網路暫時擋住上傳,${left} 秒後自動再試(已試 ${job.fails} 次)。網頁開著就好,通了會自動接著傳`
+          : `連線斷了,${left} 秒後自動重試(第 ${job.fails} 次)…`;
+        paint(job, pct);
+        await sleep(1000);
+      }
     }
   }
 }
@@ -662,6 +670,12 @@ async function sendPiece(path, blob, message, job, pct, onFail, onProgress) {
 async function uploadJob(job) {
   const f = job.file;
   const safe = f.name.replace(/[\\/]/g, "_");
+  if (!job.base && job.chunked) {
+    // 重新拖進同一個檔(同名、同大小、上次沒傳完)就接著傳,不從頭來
+    const unfinished = groupFiles(await listFiles())
+      .find(g => !g.complete && displayName(g.name) === safe && g.total === f.size);
+    if (unfinished) job.base = "files/" + unfinished.name;
+  }
   if (!job.base) job.base = `files/${stamp()}_${safe}`;
   if (!job.chunked) {
     await sendPiece(job.base, f, "upload " + safe, job, 0, null, frac => {
@@ -698,7 +712,9 @@ async function uploadJob(job) {
         });
       offset = end;
       sameSize = 0;
-      if (++streak >= 3 && chunk * 2 <= CHUNK_MAX && chunk * 2 < ceil) { chunk *= 2; streak = 0; }
+      // 網路被擋一陣子時段會一路縮到 1 MB;恢復後連續順利 6 段,就忘掉之前失敗過的大小、慢慢放大回來
+      if (++streak >= 6) ceil = job.ceil = CHUNK_MAX * 2;
+      if (streak % 3 === 0 && chunk * 2 <= CHUNK_MAX && chunk * 2 < ceil) chunk *= 2;
     } catch (e) {
       if (!e.resize) throw e;
       ceil = job.ceil = chunk;
