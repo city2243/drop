@@ -138,7 +138,8 @@ const GIT = `https://api.github.com/repos/${OWNER}/${REPO}/git/`;
 // 段的大小自動調:斷線就減半(最小 1 MB),連續順利就加倍(最大 24 MB)。
 // 段的檔名記下位元組範圍(.p<起>-<迄>of<總長>),大小不同的段也能接回。
 const SMALL_MAX = 8 * 1024 * 1024;   // 這以下一次送完
-const CHUNK_START = 8 * 1024 * 1024, CHUNK_MIN = 1024 * 1024, CHUNK_MAX = 24 * 1024 * 1024;
+// 11-02 實測:使用者網路上 8 MB 的段 3 分鐘傳 3 段,放大到 16 MB 那段卡了一個多小時,所以不再往上放大
+const CHUNK_START = 8 * 1024 * 1024, CHUNK_MIN = 1024 * 1024, CHUNK_MAX = 8 * 1024 * 1024;
 const MAX_BYTES = 10 * 1024 * 1024 * 1024;
 const PART_RE = /\.p(\d+)-(\d+)of(\d+)$/;
 // 這裡是暫存區:刪掉的檔仍留在 git 歷史裡佔空間,所以刪檔後把歷史清成只剩一個 commit,GitHub 之後會回收
@@ -251,8 +252,47 @@ function prettySize(n) {
   return (n / 1024 / 1024 / 1024).toFixed(2) + " GB";
 }
 
-async function putFile(path, b64, message, onWait, signal) {
-  return gh(path, { method: "PUT", body: JSON.stringify({ message, content: b64 }), onWait, signal });
+// 上傳用 XHR 而不是 fetch:看得到送出進度,也才抓得到「卡住」。
+// 實測使用者的網路會把一個請求吊一個多小時不回應,fetch 會一直等;
+// 這裡送資料時 30 秒沒進度、送完後 90 秒等不到回應,就中斷交給 sendPiece 重送
+const STALL_MS = 30000, REPLY_MS = 90000;
+function putFile(path, b64, message, onWait, signal, onProgress, attempt = 0) {
+  const body = JSON.stringify({ message, content: b64 });
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open("PUT", API + encPath(path));
+    xhr.setRequestHeader("Authorization", "Bearer " + token);
+    xhr.setRequestHeader("Accept", "application/vnd.github+json");
+    xhr.setRequestHeader("X-GitHub-Api-Version", "2022-11-28");
+    xhr.setRequestHeader("Content-Type", "application/json");
+    let deadline = Date.now() + STALL_MS, settled = false;
+    const finish = (fn, v) => { if (settled) return; settled = true; clearInterval(timer); signal?.removeEventListener("abort", onAbort); fn(v); };
+    const timer = setInterval(() => {
+      if (Date.now() > deadline) { xhr.abort(); finish(reject, new Error("連線卡住沒反應")); }
+    }, 2000);
+    const onAbort = () => { xhr.abort(); finish(reject, new DOMException("已取消", "AbortError")); };
+    signal?.addEventListener("abort", onAbort);
+    xhr.upload.onprogress = e => { deadline = Date.now() + STALL_MS; if (e.lengthComputable) onProgress?.(e.loaded / e.total); };
+    xhr.upload.onload = () => { deadline = Date.now() + REPLY_MS; };
+    xhr.onerror = () => finish(reject, new TypeError("連線中斷"));
+    xhr.onload = async () => {
+      const s = xhr.status, text = xhr.responseText || "";
+      const retryAfter = Number(xhr.getResponseHeader("retry-after") || 0);
+      const limited = s === 429 || (s === 403 && (retryAfter || xhr.getResponseHeader("x-ratelimit-remaining") === "0" || /secondary rate limit/i.test(text)));
+      if (limited && attempt < 5) {
+        clearInterval(timer); settled = true; signal?.removeEventListener("abort", onAbort);
+        const wait = retryAfter || 60;
+        onWait?.(wait);
+        await sleep(wait * 1000);
+        return putFile(path, b64, message, onWait, signal, onProgress, attempt + 1).then(resolve, reject);
+      }
+      if (s >= 200 && s < 300) return finish(resolve, xhr);
+      let msg = s + " " + xhr.statusText;
+      try { const j = JSON.parse(text); if (j.message) msg = s + " " + j.message; } catch {}
+      finish(reject, new Error(msg));
+    };
+    xhr.send(body);
+  });
 }
 async function deletePath(path, sha) {
   return gh(path, { method: "DELETE", body: JSON.stringify({ message: "delete " + path, sha }) });
@@ -307,6 +347,9 @@ async function cleanHistory() {
     const fresh = await (await ghFetch(GIT + "commits", {
       method: "POST", body: JSON.stringify({ message: "清理暫存歷史(只保留目前的檔案)", tree: head.tree.sha }),
     })).json();
+    // 強制改寫前再看一次 main:另一個分頁或裝置剛好傳上新的段,就這次不清,免得把它蓋掉
+    const now = await (await ghFetch(GIT + "ref/heads/main")).json();
+    if (now.object.sha !== ref.object.sha) return scheduleClean();
     await ghFetch(GIT + "refs/heads/main", { method: "PATCH", body: JSON.stringify({ sha: fresh.sha, force: true }) });
   } catch (e) { console.warn("清歷史失敗", e); }
   loadUsage();
@@ -594,11 +637,11 @@ const MAX_FAILS = 15;   // 連續失敗這麼多次才放棄(每次等愈來愈�
 
 // 送一段;斷線、GitHub 暫時出錯(實測 403「The rule did not run because of a timeout」)都自動重送。
 // 重送前先查那段是不是其實已經寫進去了,免得重複寫撞 422
-async function sendPiece(path, blob, message, job, pct, onFail) {
+async function sendPiece(path, blob, message, job, pct, onFail, onProgress) {
   for (;;) {
     try {
       await putFile(path, await blobToB64(blob), message,
-        wait => { job.msg = `GitHub 要求放慢,等 ${wait} 秒後繼續…`; paint(job, pct); }, job.ctrl.signal);
+        wait => { job.msg = `GitHub 要求放慢,等 ${wait} 秒後繼續…`; paint(job, pct); }, job.ctrl.signal, onProgress);
       job.fails = 0;
       return;
     } catch (e) {
@@ -621,7 +664,10 @@ async function uploadJob(job) {
   const safe = f.name.replace(/[\\/]/g, "_");
   if (!job.base) job.base = `files/${stamp()}_${safe}`;
   if (!job.chunked) {
-    await sendPiece(job.base, f, "upload " + safe, job);
+    await sendPiece(job.base, f, "upload " + safe, job, 0, null, frac => {
+      const p = Math.floor(frac * 100);
+      job.msg = `${p}%`; paint(job, p);
+    });
     return;
   }
   // 重試時從已經接得起來的地方繼續
@@ -642,7 +688,14 @@ async function uploadJob(job) {
     try {
       // 同一個大小連續斷兩次就改用小一半的段:太大的請求是最常被網路切掉的,偶發斷一次則照原大小重送
       await sendPiece(`files/${prefix}.p${offset}-${end}of${f.size}`, f.slice(offset, end),
-        `upload ${safe} ${pct}%`, job, pct, () => ++sameSize >= 2 && chunk > CHUNK_MIN);
+        `upload ${safe} ${pct}%`, job, pct, () => ++sameSize >= 2 && chunk > CHUNK_MIN,
+        frac => {
+          // 段內也顯示進度,看得出是不是還在動
+          const now = offset + frac * (end - offset), secs = (Date.now() - started) / 1000;
+          const p = Math.floor(now / f.size * 100);
+          job.msg = `${p}%(${prettySize(now)} / ${prettySize(f.size)})` + (secs > 1 && now > from ? ` · ${prettySize((now - from) / secs)}/秒` : "");
+          paint(job, p);
+        });
       offset = end;
       sameSize = 0;
       if (++streak >= 3 && chunk * 2 <= CHUNK_MAX && chunk * 2 < ceil) { chunk *= 2; streak = 0; }
