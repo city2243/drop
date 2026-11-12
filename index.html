@@ -289,7 +289,7 @@ function putFile(path, b64, message, onWait, signal, onProgress, attempt = 0) {
       if (s >= 200 && s < 300) return finish(resolve, xhr);
       let msg = s + " " + xhr.statusText;
       try { const j = JSON.parse(text); if (j.message) msg = s + " " + j.message; } catch {}
-      finish(reject, new Error(msg));
+      finish(reject, Object.assign(new Error(msg), { status: s }));
     };
     xhr.send(body);
   });
@@ -625,7 +625,7 @@ function paint(job, pct) {
     setTimeout(() => job.li.remove(), 8000);
   } else {
     job.msgEl.className = "err";
-    job.msgEl.textContent = `${size} · 失敗:${job.msg}` + (job.chunked && job.base ? "(按重試會從斷掉的地方接著傳)" : "");
+    job.msgEl.textContent = `${size} · 失敗:${job.msg}` + (job.chunked && job.base && job.msg !== STALE_FILE ? "(按重試會從斷掉的地方接著傳)" : "");
     fill.style.width = "0";
   }
 }
@@ -639,16 +639,27 @@ const QUICK_FAILS = 6, SLOW_WAIT_S = 120;
 
 // 送一段;斷線、GitHub 暫時出錯(實測 403「The rule did not run because of a timeout」)都自動重送。
 // 重送前先查那段是不是其實已經寫進去了,免得重複寫撞 422
+// 11-12 實測:檔案拖進來之後又被存檔改過、搬走或刪掉,瀏覽器就永遠讀不到它(NotReadableError / NotFoundError),
+// 重試幾次都一樣。以前把它當成「連線斷了」無限重試,還把後面排隊的檔全卡住,所以讀檔失敗直接停下說清楚
+const STALE_FILE = "這個檔放進來之後被改過、搬走或刪掉了(例如 Word 又存了一次),網頁讀不到。請按「取消」,再把最新的檔重新拖進來";
+// 這些錯誤重送也不會好(金鑰、路徑、檔案太大等),直接停下顯示原因;其餘(斷線、逾時、GitHub 暫時出錯)才自動重送
+const isFatal = e => [400, 401, 404, 413, 422].includes(e.status) ||
+  (e.status === 403 && /not accessible|permission|forbidden/i.test(e.message));
 async function sendPiece(path, blob, message, job, pct, onFail, onProgress) {
   for (;;) {
+    let b64;
+    try { b64 = await blobToB64(blob); }
+    catch { throw new Error(STALE_FILE); }
     try {
-      await putFile(path, await blobToB64(blob), message,
+      await putFile(path, b64, message,
         wait => { job.msg = `GitHub 要求放慢,等 ${wait} 秒後繼續…`; paint(job, pct); }, job.ctrl.signal, onProgress);
       job.fails = 0;
       return;
     } catch (e) {
-      if (job.cancelled || /^401\b/.test(e.message)) throw e;
+      if (job.cancelled) throw e;
       if (await exists(path)) { job.fails = 0; return; }
+      if (isFatal(e)) throw new Error("GitHub 拒絕:" + e.message);
+      job.lastErr = e.message;
       job.fails = (job.fails || 0) + 1;
       if (onFail && onFail()) throw Object.assign(new Error("resize"), { resize: true });
       const slow = job.fails > QUICK_FAILS;
@@ -657,9 +668,9 @@ async function sendPiece(path, blob, message, job, pct, onFail, onProgress) {
       // 倒數顯示,讓人知道網頁還在等、沒有當掉
       for (let left = wait; left > 0; left--) {
         if (job.cancelled) throw new Error("已取消");
-        job.msg = slow
+        job.msg = (slow
           ? `網路暫時擋住上傳,${left} 秒後自動再試(已試 ${job.fails} 次)。網頁開著就好,通了會自動接著傳`
-          : `連線斷了,${left} 秒後自動重試(第 ${job.fails} 次)…`;
+          : `上傳沒成功,${left} 秒後自動重試(第 ${job.fails} 次)…`) + `〔原因:${job.lastErr}〕`;
         paint(job, pct);
         await sleep(1000);
       }
