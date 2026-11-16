@@ -106,7 +106,7 @@
       <div id="drop" class="drop">
         <div class="big">把檔案拖進這個視窗任何地方就存好</div>
         也可以點這裡選檔,或按 Ctrl+V 貼上檔案<br>
-        <span class="muted">單檔最大 10 GB;超過 30 MB 會分段上傳,比較久</span>
+        <span class="muted">單檔最大 10 GB;超過 1 MB 會切成每段 1 MB 上傳,斷了會從斷掉的地方接著傳</span>
       </div>
       <input id="fileInput" type="file" multiple class="hidden">
       <ul id="queue"></ul>
@@ -135,11 +135,12 @@ const REPO = "drop-storage";
 const API = `https://api.github.com/repos/${OWNER}/${REPO}/contents/`;
 const GIT = `https://api.github.com/repos/${OWNER}/${REPO}/git/`;
 // GitHub API 單次寫入實測約 38–40 MB 就回 422;使用者的網路還會切斷大的上傳請求,所以大檔切小段送,
-// 段的大小自動調:斷線就減半(最小 1 MB),連續順利就加倍(最大 24 MB)。
+// 段的大小自動調:斷線就減半(最小 256 KB),連續順利再放大回來(最大 1 MB)。
 // 段的檔名記下位元組範圍(.p<起>-<迄>of<總長>),大小不同的段也能接回。
-const SMALL_MAX = 8 * 1024 * 1024;   // 這以下一次送完
+// 11-16 使用者要求切得很小:每段 1 MB(斷線再縮到 512 KB、256 KB),超過 1 MB 的檔就分段
+const SMALL_MAX = 1024 * 1024;   // 這以下一次送完
 // 11-02 實測:使用者網路上 8 MB 的段 3 分鐘傳 3 段,放大到 16 MB 那段卡了一個多小時,所以不再往上放大
-const CHUNK_START = 8 * 1024 * 1024, CHUNK_MIN = 1024 * 1024, CHUNK_MAX = 8 * 1024 * 1024;
+const CHUNK_START = 1024 * 1024, CHUNK_MIN = 256 * 1024, CHUNK_MAX = 1024 * 1024;
 const MAX_BYTES = 10 * 1024 * 1024 * 1024;
 const PART_RE = /\.p(\d+)-(\d+)of(\d+)$/;
 // 這裡是暫存區:刪掉的檔仍留在 git 歷史裡佔空間,所以刪檔後把歷史清成只剩一個 commit,GitHub 之後會回收
