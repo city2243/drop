@@ -106,7 +106,7 @@
       <div id="drop" class="drop">
         <div class="big">把檔案拖進這個視窗任何地方就存好</div>
         也可以點這裡選檔,或按 Ctrl+V 貼上檔案<br>
-        <span class="muted">單檔最大 2 GB;超過 100 KB 會切成每段 100 KB 上傳,斷了會從斷掉的地方接著傳</span>
+        <span class="muted">單檔最大 2 GB;超過 100 KB 會切成每段 100 KB、同時送 6 段,斷了會從斷掉的地方接著傳</span>
       </div>
       <input id="fileInput" type="file" multiple class="hidden">
       <ul id="queue"></ul>
@@ -140,7 +140,9 @@ const GIT = `https://api.github.com/repos/${OWNER}/${REPO}/git/`;
 // 11-16 使用者要求每段 150 KB 以下:檔案每段切 100 KB(轉成 base64 送出約 137 KB,整個請求也在 150 KB 內),斷線再縮到 50 KB
 const SMALL_MAX = 100 * 1024;   // 這以下一次送完
 // 11-02 實測:使用者網路上 8 MB 的段 3 分鐘傳 3 段,放大到 16 MB 那段卡了一個多小時,所以不再往上放大
-const CHUNK_START = 100 * 1024, CHUNK_MIN = 50 * 1024, CHUNK_MAX = 100 * 1024;
+const CHUNK_START = 100 * 1024, CHUNK_MIN = 50 * 1024;
+// 11-19 改成同時送 6 段、每 25 段 commit 一次(每段約 2.5 秒,同時送就快好幾倍;寫入次數另由 writeGate 壓在每分鐘 70 次內)
+const WORKERS = 6, BATCH = 25;
 const MAX_BYTES = 2 * 1024 * 1024 * 1024;   // 每段 100 KB,2 GB 就是兩萬段;再大列檔會超過 GitHub 上限
 const PART_RE = /\.p(\d+)-(\d+)of(\d+)$/;
 // 這裡是暫存區:刪掉的檔仍留在 git 歷史裡佔空間,所以刪檔後把歷史清成只剩一個 commit,GitHub 之後會回收
@@ -255,13 +257,20 @@ function prettySize(n) {
 
 // 上傳用 XHR 而不是 fetch:看得到送出進度,也才抓得到「卡住」。
 // 實測使用者的網路會把一個請求吊一個多小時不回應,fetch 會一直等;
-// 這裡送資料時 30 秒沒進度、送完後 90 秒等不到回應,就中斷交給 sendPiece 重送
+// 這裡送資料時 30 秒沒進度、送完後 90 秒等不到回應,就中斷交給 retrying 重送
 const STALL_MS = 30000, REPLY_MS = 90000;
-function putFile(path, b64, message, onWait, signal, onProgress, attempt = 0) {
-  const body = JSON.stringify({ message, content: b64 });
+function putFile(path, b64, message, onWait, signal, onProgress) {
+  return sendXHR("PUT", API + encPath(path), { message, content: b64 }, onWait, signal, onProgress);
+}
+// 只把一段內容存成 git blob(不產生 commit),比 putFile 快,而且可以好幾段同時送;回傳 { sha }
+function postBlob(b64, onWait, signal) {
+  return sendXHR("POST", GIT + "blobs", { content: b64, encoding: "base64" }, onWait, signal);
+}
+function sendXHR(method, url, payload, onWait, signal, onProgress, attempt = 0) {
+  const body = JSON.stringify(payload);
   return new Promise((resolve, reject) => {
     const xhr = new XMLHttpRequest();
-    xhr.open("PUT", API + encPath(path));
+    xhr.open(method, url);
     xhr.setRequestHeader("Authorization", "Bearer " + token);
     xhr.setRequestHeader("Accept", "application/vnd.github+json");
     xhr.setRequestHeader("X-GitHub-Api-Version", "2022-11-28");
@@ -285,9 +294,9 @@ function putFile(path, b64, message, onWait, signal, onProgress, attempt = 0) {
         const wait = retryAfter || 60;
         onWait?.(wait);
         await sleep(wait * 1000);
-        return putFile(path, b64, message, onWait, signal, onProgress, attempt + 1).then(resolve, reject);
+        return sendXHR(method, url, payload, onWait, signal, onProgress, attempt + 1).then(resolve, reject);
       }
-      if (s >= 200 && s < 300) return finish(resolve, xhr);
+      if (s >= 200 && s < 300) { let j = {}; try { j = JSON.parse(text); } catch {} return finish(resolve, j); }
       let msg = s + " " + xhr.statusText;
       try { const j = JSON.parse(text); if (j.message) msg = s + " " + j.message; } catch {}
       finish(reject, Object.assign(new Error(msg), { status: s }));
@@ -312,25 +321,45 @@ async function rawBlob(item) {
   return res.blob();
 }
 
-// 一次刪掉很多個檔(一個大檔的所有段):只做一個 commit,不用一段一段刪
-async function deletePaths(paths, message) {
+// GitHub 規定每分鐘約 80 次「會寫入東西」的請求,超過會被擋一陣子;自己先壓在 70 次以內
+// 傳段最多用 60 次,留 10 次給 commit:11-19 實測 62 段 20 秒送完,commit 卻排隊等了 45 秒,畫面卡在 100%
+const WRITES_PER_MIN = 70, BLOB_WRITES_PER_MIN = 60;
+let writeLog = [];
+async function writeGate(limit = WRITES_PER_MIN, onWait) {
+  for (let waited = false; ; waited = true) {
+    const now = Date.now();
+    writeLog = writeLog.filter(t => now - t < 60000);
+    if (writeLog.length < limit) { writeLog.push(now); if (waited) onWait?.(0); return; }
+    const ms = 60000 - (now - writeLog[writeLog.length - limit]) + 50;
+    onWait?.(Math.ceil(ms / 1000));
+    await sleep(Math.min(ms, 1000));
+  }
+}
+
+// 一次改很多個檔,只做一個 commit。changes:[{ path, sha }],sha 是 null 代表刪掉
+async function commitTree(changes, message) {
   for (let attempt = 1; ; attempt++) {
     const ref = await (await ghFetch(GIT + "ref/heads/main")).json();
     const head = await (await ghFetch(GIT + "commits/" + ref.object.sha)).json();
+    await writeGate();
     const tree = await (await ghFetch(GIT + "trees", {
       method: "POST",
-      body: JSON.stringify({ base_tree: head.tree.sha, tree: paths.map(path => ({ path, mode: "100644", type: "blob", sha: null })) }),
+      body: JSON.stringify({ base_tree: head.tree.sha, tree: changes.map(c => ({ path: c.path, mode: "100644", type: "blob", sha: c.sha })) }),
     })).json();
+    await writeGate();
     const commit = await (await ghFetch(GIT + "commits", {
       method: "POST", body: JSON.stringify({ message, tree: tree.sha, parents: [head.sha] }),
     })).json();
     try {
       // 不強制:這中間若有別的檔剛上傳完,main 已經往前,就重新來過,免得把它蓋掉
+      await writeGate();
       await ghFetch(GIT + "refs/heads/main", { method: "PATCH", body: JSON.stringify({ sha: commit.sha }) });
       return;
     } catch (e) { if (attempt >= 5) throw e; await sleep(1000 * attempt); }
   }
 }
+// 一次刪掉很多個檔(一個大檔的所有段)
+const deletePaths = (paths, message) => commitTree(paths.map(path => ({ path, sha: null })), message);
 
 // ---------- 清歷史:main 換成一個沒有上一代的 commit(檔案不變) ----------
 let cleanTimer = null;
@@ -646,19 +675,16 @@ const STALE_FILE = "這個檔放進來之後被改過、搬走或刪掉了(例�
 // 這些錯誤重送也不會好(金鑰、路徑、檔案太大等),直接停下顯示原因;其餘(斷線、逾時、GitHub 暫時出錯)才自動重送
 const isFatal = e => [400, 401, 404, 413, 422].includes(e.status) ||
   (e.status === 403 && /not accessible|permission|forbidden/i.test(e.message));
-async function sendPiece(path, blob, message, job, pct, onFail, onProgress) {
+const readB64 = blob => blobToB64(blob).catch(() => { throw new Error(STALE_FILE); });
+
+// 跑 attempt(),失敗就等一下再試,成功回傳它的結果。
+// already():重送前先查是不是其實已經寫進去了(免得重複寫撞 422);onFail() 回 true 代表要改用小段,丟出 resize
+async function retrying(job, attempt, { already, onFail, show }) {
   for (;;) {
-    let b64;
-    try { b64 = await blobToB64(blob); }
-    catch { throw new Error(STALE_FILE); }
-    try {
-      await putFile(path, b64, message,
-        wait => { job.msg = `GitHub 要求放慢,等 ${wait} 秒後繼續…`; paint(job, pct); }, job.ctrl.signal, onProgress);
-      job.fails = 0;
-      return;
-    } catch (e) {
-      if (job.cancelled) throw e;
-      if (await exists(path)) { job.fails = 0; return; }
+    try { const r = await attempt(); job.fails = 0; return r; }
+    catch (e) {
+      if (job.cancelled || job.halt || e.message === STALE_FILE) throw e;
+      if (already && await already()) { job.fails = 0; return; }
       if (isFatal(e)) throw new Error("GitHub 拒絕:" + e.message);
       job.lastErr = e.message;
       job.fails = (job.fails || 0) + 1;
@@ -668,13 +694,14 @@ async function sendPiece(path, blob, message, job, pct, onFail, onProgress) {
       await waitOnline();
       // 倒數顯示,讓人知道網頁還在等、沒有當掉
       for (let left = wait; left > 0; left--) {
-        if (job.cancelled) throw new Error("已取消");
-        job.msg = (slow
+        if (job.cancelled || job.halt) throw new Error("已取消");
+        job.note = (slow
           ? `網路暫時擋住上傳,${left} 秒後自動再試(已試 ${job.fails} 次)。網頁開著就好,通了會自動接著傳`
-          : `上傳沒成功,${left} 秒後自動重試(第 ${job.fails} 次)…`) + `〔原因:${job.lastErr}〕`;
-        paint(job, pct);
+          : `有一段沒成功,${left} 秒後自動重試(第 ${job.fails} 次)`) + `〔原因:${job.lastErr}〕`;
+        show();
         await sleep(1000);
       }
+      job.note = "";
     }
   }
 }
@@ -689,56 +716,86 @@ async function uploadJob(job) {
     if (unfinished) job.base = "files/" + unfinished.name;
   }
   if (!job.base) job.base = `files/${stamp()}_${safe}`;
+  job.halt = false; job.note = "";
+  const onWait = wait => { job.note = `GitHub 要求放慢,等 ${wait} 秒後繼續`; show(); };
+  let sent = 0, from = 0;
+  const started = Date.now(), total = f.size;
+  function show(frac) {
+    const now = frac == null ? sent : frac * total, p = Math.floor(now / total * 100), secs = (Date.now() - started) / 1000;
+    job.msg = `${p}%(${prettySize(now)} / ${prettySize(total)})`
+      + (secs > 1 && now > from ? ` · ${prettySize((now - from) / secs)}/秒` : "") + (job.note ? " · " + job.note : "");
+    paint(job, p);
+  }
   if (!job.chunked) {
-    await sendPiece(job.base, f, "upload " + safe, job, 0, null, frac => {
-      const p = Math.floor(frac * 100);
-      job.msg = `${p}%`; paint(job, p);
-    });
+    await retrying(job, async () => {
+      const b64 = await readB64(f);
+      await writeGate();
+      return putFile(job.base, b64, "upload " + safe, onWait, job.ctrl.signal, show);
+    }, { already: () => exists(job.base), show });
     return;
   }
-  // 重試時從已經接得起來的地方繼續
+
+  // 大檔:每段只存成 git blob(不產生 commit),WORKERS 段同時送,每 BATCH 段才 commit 一次。
+  // 11-19 實測:以前每段都是一個 commit,一段要 4–5 秒;blob 單段約 2.5 秒,同時 6 段 12 段只要 6 秒。
+  // 沒 commit 的段關掉分頁就沒了,最多重送一批;重試或重新拖進來時,從已經 commit、接得起來的地方繼續
   const prefix = job.base.replace(/^files\//, "");
   const mine = groupFiles((await listFiles()).filter(i => isMine(i.name, prefix)))[0];
-  let offset = mine ? mine.done : 0;
-  // ceil:這次上傳中曾經失敗過的段大小,之後放大不超過它,免得在斷線邊緣反覆試
-  let chunk = job.chunk || CHUNK_START, ceil = job.ceil || CHUNK_MAX * 2, streak = 0, sameSize = 0;
-  const started = Date.now(), from = offset;
-  while (offset < f.size) {
-    if (job.cancelled) throw new Error("已取消");
-    const end = Math.min(offset + chunk, f.size);
-    const pct = Math.floor(offset / f.size * 100);
-    const secs = (Date.now() - started) / 1000;
-    const speed = offset > from && secs > 1 ? ` · ${prettySize((offset - from) / secs)}/秒` : "";
-    job.msg = `${pct}%(${prettySize(offset)} / ${prettySize(f.size)})${speed}`;
-    paint(job, pct);
-    try {
-      // 同一個大小連續斷兩次就改用小一半的段:太大的請求是最常被網路切掉的,偶發斷一次則照原大小重送
-      await sendPiece(`files/${prefix}.p${offset}-${end}of${f.size}`, f.slice(offset, end),
-        `upload ${safe} ${pct}%`, job, pct, () => ++sameSize >= 2 && chunk > CHUNK_MIN,
-        frac => {
-          // 段內也顯示進度,看得出是不是還在動
-          const now = offset + frac * (end - offset), secs = (Date.now() - started) / 1000;
-          const p = Math.floor(now / f.size * 100);
-          job.msg = `${p}%(${prettySize(now)} / ${prettySize(f.size)})` + (secs > 1 && now > from ? ` · ${prettySize((now - from) / secs)}/秒` : "");
-          paint(job, p);
-        });
-      offset = end;
-      sameSize = 0;
-      // 網路被擋一陣子時段會一路縮到 1 MB;恢復後連續順利 6 段,就忘掉之前失敗過的大小、慢慢放大回來
-      if (++streak >= 6) ceil = job.ceil = CHUNK_MAX * 2;
-      if (streak % 3 === 0 && chunk * 2 <= CHUNK_MAX && chunk * 2 < ceil) chunk *= 2;
-    } catch (e) {
-      if (!e.resize) throw e;
-      ceil = job.ceil = chunk;
-      chunk = Math.max(CHUNK_MIN, Math.floor(chunk / 2));
-      streak = 0; sameSize = 0;
-      job.msg = `連線斷了,改用 ${prettySize(chunk)} 的小段重送…`;
-      paint(job, pct);
-      await waitOnline();
-      await sleep(2000);
+  let next = mine ? mine.done : 0;
+  sent = from = next;
+  let chunk = CHUNK_START, sameSize = 0, stop = null;
+  const redo = [];                         // 連斷兩次的段切成兩半放這裡重送
+  let pending = [], chain = Promise.resolve();
+  const flush = () => {
+    const batch = pending.splice(0);
+    if (batch.length) {
+      const p = Math.floor(sent / total * 100);
+      chain = chain.then(() => retrying(job, () => commitTree(batch, `upload ${safe} ${p}%`), { show }));
     }
-    job.chunk = chunk;
+    return chain;
+  };
+  async function worker() {
+    while (!stop) {
+      if (job.cancelled) throw new Error("已取消");
+      let range = redo.shift();
+      if (!range) {
+        if (next >= total) return;
+        range = [next, Math.min(next + chunk, total)];
+        next = range[1];
+      }
+      const [s, e] = range;
+      let res;
+      try {
+        res = await retrying(job, async () => {
+          const b64 = await readB64(f.slice(s, e));
+          await writeGate(BLOB_WRITES_PER_MIN, secs => {
+            job.note = secs ? `GitHub 每分鐘寫入次數有上限,約 ${secs} 秒後繼續` : ""; show();
+          });
+          return postBlob(b64, onWait, job.ctrl.signal);
+        }, { show, onFail: () => ++sameSize >= 2 && e - s > CHUNK_MIN });
+      } catch (err) {
+        if (!err.resize) throw err;
+        // 同一大小連斷兩次:這段切成兩半重送,之後的新段也改用小段
+        chunk = CHUNK_MIN; sameSize = 0;
+        const mid = s + Math.ceil((e - s) / 2);
+        redo.unshift([s, mid], [mid, e]);
+        job.note = `連線不穩,改用 ${prettySize(CHUNK_MIN)} 的小段`; show();
+        await waitOnline(); await sleep(2000);
+        continue;
+      }
+      sameSize = 0;
+      pending.push({ path: `files/${prefix}.p${s}-${e}of${total}`, sha: res.sha });
+      sent += e - s; show();
+      if (pending.length >= BATCH) await flush();
+    }
   }
+  await Promise.all(Array.from({ length: WORKERS }, () =>
+    worker().catch(e => { stop = stop || e; job.halt = true; })));
+  // 出錯停下時,已經送上去的段也先 commit,下次從那裡接著傳
+  if (!job.cancelled) {
+    job.halt = false;
+    await flush().catch(e => { stop = stop || e; });
+  }
+  if (stop) throw stop;
 }
 
 // 拉錯檔時用:排隊中的直接拿掉;上傳中的中斷連線,再把已經傳上去的段刪乾淨
